@@ -43,6 +43,18 @@ export async function GET(request: NextRequest) {
       dataSize: JSON.stringify(successResponse).length,
       duration: `${duration}ms`,
       message: "Logs are working perfectly!",
+      timestamp: new Date().toISOString(),
+      date: new Date().toLocaleDateString("en-US", {
+        year: "numeric",
+        month: "2-digit",
+        day: "2-digit",
+      }),
+      time: new Date().toLocaleTimeString("en-US", {
+        hour: "2-digit",
+        minute: "2-digit",
+        second: "2-digit",
+        hour12: true,
+      }),
     });
 
     return NextResponse.json(successResponse, { status: 200 });
