@@ -22,8 +22,11 @@ A monorepo with:
 - ✅ Automatic tracing for all requests
 - ✅ Structured logging (terminal + Jaeger)
 - ✅ Multiple apps (ibe-app, top-app) using shared setup
-- ✅ Color-coded logs in terminal
+- ✅ Color-coded logs in terminal, JSON Lines in production (CloudWatch/Datadog-ready)
 - ✅ Logs visible in Jaeger as span events
+- ✅ Trace ID returned in every response header (`x-trace-id`) and stamped on every log line
+- ✅ Failed requests marked as errored spans in Jaeger (`span.recordException`)
+- ✅ An OTEL Collector sitting between apps and Jaeger, so the backend can change without touching app code
 
 ### Architecture
 
@@ -34,8 +37,8 @@ Monorepo Root
 │   ├── package.json
 │   └── src/
 │       ├── index.ts            ← Main export
-│       ├── logger.ts           ← Logger initialization
-│       └── log-helper.ts       ← Easy logger API
+│       ├── logger.ts           ← LoggerProvider initialization
+│       └── log-helper.ts       ← createLogger() + getTraceContext()
 │
 ├── apps/ibe-app/               ← App 1
 │   ├── package.json
@@ -45,14 +48,35 @@ Monorepo Root
 │       ├── page.tsx
 │       └── api/test-logs/route.ts
 │
-└── apps/top-app/               ← App 2
-    ├── package.json
-    ├── instrumentation.ts      ← Uses shared OTEL
-    ├── .env.local
-    └── app/
-        ├── page.tsx
-        └── api/test-logs/route.ts
+├── apps/top-app/               ← App 2
+│   ├── package.json
+│   ├── instrumentation.ts      ← Uses shared OTEL
+│   ├── .env.local
+│   └── app/
+│       ├── page.tsx
+│       └── api/test-logs/route.ts
+│
+├── otel-collector-config.yaml  ← OTLP receiver → batch → Jaeger + debug
+└── docker-compose.yml          ← jaeger + otel-collector services
 ```
+
+### Request Flow
+
+```
+Browser/curl
+   ↓
+Next.js app (ibe-app / top-app)
+   ↓ logger.info()/error() → console + span event
+   ↓ OTLP export → localhost:4317
+otel-collector (batches, can fan out to multiple backends)
+   ↓ localhost:4317 is now owned by the collector, not Jaeger
+jaeger:4317 (internal docker network)
+   ↓
+Jaeger UI @ localhost:16686
+```
+
+App code and `.env.local` never change when the backend changes — only
+`otel-collector-config.yaml` does.
 
 ---
 
@@ -107,7 +131,7 @@ export function getLogger(name: string) {
 Create new file at `packages/otel/src/log-helper.ts`:
 
 ```typescript
-import { trace } from "@opentelemetry/api";
+import { trace, SpanStatusCode } from "@opentelemetry/api";
 
 export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
@@ -124,17 +148,48 @@ export interface LogAttributes {
   [key: string]: string | number | boolean | undefined | any;
 }
 
+// Returns the active trace/span IDs, or undefined outside a request context.
+export function getTraceContext(): { traceId: string; spanId: string } | undefined {
+  const span = trace.getActiveSpan();
+  if (!span) return undefined;
+
+  const ctx = span.spanContext();
+  if (!ctx || ctx.traceId === "00000000000000000000000000000000") return undefined;
+
+  return { traceId: ctx.traceId, spanId: ctx.spanId };
+}
+
 export function createLogger(name: string) {
   return {
-    log(level: LogLevel, message: string, attributes?: LogAttributes) {
+    log(level: LogLevel, message: string, attributes?: LogAttributes, err?: unknown) {
       const timestamp = new Date().toISOString();
       const color = colorMap[level];
+      const traceContext = getTraceContext();
 
-      // Console output with color
-      const prefix = `${color}[${level}]${resetColor}`;
-      console.log(`${prefix} ${timestamp} ${name} - ${message}`, attributes || "");
+      const logObject = {
+        timestamp,
+        level,
+        logger: name,
+        message,
+        ...(traceContext && { trace_id: traceContext.traceId, span_id: traceContext.spanId }),
+        ...(attributes && attributes),
+      };
 
-      // Add to current span as event (visible in Jaeger)
+      if (process.env.NODE_ENV === "production") {
+        // Production: JSON Lines format - one JSON object per line (CloudWatch, Datadog, etc.)
+        console.log(JSON.stringify(logObject));
+      } else {
+        // Development: pretty-printed, color-coded
+        const prefix = `${color}[${level}]${resetColor}`;
+        const traceSuffix = traceContext ? ` (trace=${traceContext.traceId})` : "";
+        console.log(`${prefix} ${timestamp} ${name} - ${message}${traceSuffix}`);
+        if (attributes && Object.keys(attributes).length > 0) {
+          console.log(JSON.stringify(attributes, null, 2));
+        }
+      }
+
+      // Attach to the active span (visible in Jaeger) and mark the span as
+      // failed when logging an error with a real Error object.
       try {
         const span = trace.getActiveSpan();
         if (span) {
@@ -144,8 +199,15 @@ export function createLogger(name: string) {
             "log.logger": name,
             ...(attributes && flattenAttributes(attributes)),
           });
+
+          if (level === "ERROR") {
+            if (err instanceof Error) {
+              span.recordException(err);
+            }
+            span.setStatus({ code: SpanStatusCode.ERROR, message });
+          }
         }
-      } catch (error) {
+      } catch (spanError) {
         // Span context might not be available
       }
     },
@@ -154,8 +216,10 @@ export function createLogger(name: string) {
       this.log("INFO", message, attributes);
     },
 
-    error(message: string, attributes?: LogAttributes) {
-      this.log("ERROR", message, attributes);
+    // Pass the caught error as the 3rd arg to record it on the span
+    // (span.recordException) and mark the span status as ERROR.
+    error(message: string, attributes?: LogAttributes, err?: unknown) {
+      this.log("ERROR", message, attributes, err);
     },
 
     warn(message: string, attributes?: LogAttributes) {
@@ -198,7 +262,7 @@ import { registerOTel } from "@vercel/otel";
 import { initializeLoggerProvider } from "./logger";
 
 export { getLogger } from "./logger";
-export { createLogger } from "./log-helper";
+export { createLogger, getTraceContext } from "./log-helper";
 export type { Logger, LogLevel, LogAttributes } from "./log-helper";
 
 export function register() {
@@ -271,18 +335,20 @@ OTEL_EXPORTER_OTLP_ENDPOINT=http://localhost:4317
 Create new file at `apps/ibe-app/app/api/test-logs/route.ts`:
 
 ```typescript
-import { createLogger } from "@yourorg/otel";
+import { createLogger, getTraceContext } from "@yourorg/otel";
 import { NextRequest, NextResponse } from "next/server";
 
 const logger = createLogger("api/test-logs");
 
 export async function GET(request: NextRequest) {
   const startTime = Date.now();
+  const requestId = crypto.randomUUID();
 
   logger.info("GET /api/test-logs called", {
     method: request.method,
     url: request.url,
     userAgent: request.headers.get("user-agent"),
+    requestId,
   });
 
   try {
@@ -293,26 +359,41 @@ export async function GET(request: NextRequest) {
     };
 
     const duration = Date.now() - startTime;
+    const traceId = getTraceContext()?.traceId;
 
     logger.info("Request successful", {
+      requestId,
       status: 200,
       dataSize: JSON.stringify(data).length,
       duration: `${duration}ms`,
     });
 
-    return NextResponse.json(data);
+    // Returning the trace ID lets you jump from a user-reported error
+    // straight to the matching trace in Jaeger.
+    return NextResponse.json(data, {
+      headers: traceId ? { "x-trace-id": traceId } : undefined,
+    });
   } catch (error) {
     const duration = Date.now() - startTime;
+    const traceId = getTraceContext()?.traceId;
 
-    logger.error("Request failed", {
-      error: error instanceof Error ? error.message : String(error),
-      stack: error instanceof Error ? error.stack : undefined,
-      duration: `${duration}ms`,
-    });
+    // Pass the caught `error` as the 3rd argument: it calls
+    // span.recordException(error) + span.setStatus(ERROR), so the span
+    // shows up as failed in Jaeger instead of a normal "OK" span.
+    logger.error(
+      "Request failed",
+      {
+        requestId,
+        status: 500,
+        error: error instanceof Error ? error.message : String(error),
+        duration: `${duration}ms`,
+      },
+      error
+    );
 
     return NextResponse.json(
-      { error: "Internal Server Error" },
-      { status: 500 }
+      { error: "Internal Server Error", requestId, traceId },
+      { status: 500, headers: traceId ? { "x-trace-id": traceId } : undefined }
     );
   }
 }
@@ -410,7 +491,93 @@ Same as Step 2.5 (identical code)
 
 ---
 
-### PHASE 4: Install Dependencies
+### PHASE 4: Add the OTEL Collector
+
+Create `otel-collector-config.yaml` at the monorepo root:
+
+```yaml
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+processors:
+  batch:
+    timeout: 5s
+    send_batch_size: 1024
+
+exporters:
+  otlp/jaeger:
+    endpoint: jaeger:4317
+    tls:
+      insecure: true
+  debug:
+    verbosity: normal
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [otlp/jaeger, debug]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug]
+```
+
+Update `docker-compose.yml` — stop publishing Jaeger's OTLP ports directly,
+and add the collector in front of it:
+
+```yaml
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: jaeger
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "9411:9411"     # Zipkin compatible endpoint
+    # 4317/4318 are NOT published to the host anymore — the collector
+    # below owns those ports and forwards to jaeger:4317 internally.
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+      - COLLECTOR_ZIPKIN_HTTP_PORT=9411
+      - STORAGE=badger
+      - BADGER_EPHEMERAL=false
+      - BADGER_DIRECTORY_VALUE=/badger/data
+      - BADGER_DIRECTORY_KEY=/badger/key
+    volumes:
+      - jaeger-storage:/badger
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:16686"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    container_name: otel-collector
+    command: ["--config=/etc/otel-collector-config.yaml"]
+    volumes:
+      - ./otel-collector-config.yaml:/etc/otel-collector-config.yaml:ro
+    ports:
+      - "4317:4317"     # OTLP gRPC receiver - apps point here now
+      - "4318:4318"     # OTLP HTTP receiver
+    depends_on:
+      jaeger:
+        condition: service_healthy
+
+volumes:
+  jaeger-storage:
+```
+
+Apps keep sending to `http://localhost:4317` — nothing changes in
+`.env.local`, since the collector now sits on that port instead of Jaeger.
+
+### PHASE 5: Install Dependencies
 
 From monorepo root, run:
 
@@ -427,15 +594,19 @@ This will:
 
 ## Testing
 
-### Step 1: Start Jaeger
+### Step 1: Start Jaeger + OTEL Collector
 
 ```bash
 docker-compose up -d
 ```
 
-Verify running:
+This starts **two** containers: `jaeger` and `otel-collector`. Apps send
+traces to the collector (`localhost:4317`), which batches them and forwards
+to Jaeger internally — no `.env.local` change needed.
+
+Verify both are running:
 ```bash
-docker ps | grep jaeger
+docker ps | grep -E "jaeger|otel-collector"
 ```
 
 ### Step 2: Start Apps
@@ -465,11 +636,19 @@ curl http://localhost:3001/api/test-logs
 ### Step 4: View Logs
 
 **In Terminal:**
-You should see color-coded logs:
+You should see color-coded logs, each tagged with the active trace ID:
 ```
-[INFO] 2026-09-05T14:27:25.123Z api/test-logs - GET /api/test-logs called
-[INFO] 2026-09-05T14:27:25.245Z api/test-logs - Request successful
+[INFO] 2026-09-05T14:27:25.123Z api/test-logs - GET /api/test-logs called (trace=220be882e6353f0d7fafc17730fa5152)
+[INFO] 2026-09-05T14:27:25.245Z api/test-logs - Request successful (trace=220be882e6353f0d7fafc17730fa5152)
 ```
+
+**In the response headers:**
+```bash
+curl -i http://localhost:3000/api/test-logs | grep x-trace-id
+# x-trace-id: 220be882e6353f0d7fafc17730fa5152
+```
+
+Copy that value straight into Jaeger's search box to jump to the exact trace.
 
 **In Jaeger:**
 1. Open [http://localhost:16686](http://localhost:16686)
@@ -479,6 +658,9 @@ You should see color-coded logs:
 5. **Scroll down** to see "Logs" section with events like:
    - `log.info: "GET /api/test-logs called"`
    - `log.info: "Request successful"`
+6. If the request threw an error, the span itself shows as **failed** (red) —
+   not just a log event — because `logger.error(msg, attrs, error)` calls
+   `span.recordException()` and `span.setStatus(ERROR)` under the hood.
 
 ---
 
@@ -500,10 +682,12 @@ logger.info("User logged in", {
   duration: "245ms"
 });
 
+// Pass the caught error as the 3rd argument to record it on the active
+// span (span.recordException + span.setStatus(ERROR)) — not just as a
+// log event. Without it, a failed request still shows "OK" in Jaeger.
 logger.error("Database error", {
-  error: error.message,
   query: "SELECT * FROM users"
-});
+}, error);
 
 logger.warn("Cache expiring", {
   current: 95,
@@ -515,10 +699,22 @@ logger.debug("Processing item", {
 });
 ```
 
+### Getting the Trace ID
+
+Use `getTraceContext()` anywhere inside a request to read the active
+trace/span ID — useful for returning it in a response header or a support
+ticket so it can be pasted straight into Jaeger's search box.
+
+```typescript
+import { getTraceContext } from "@yourorg/otel";
+
+const traceId = getTraceContext()?.traceId; // undefined outside a request
+```
+
 ### In API Routes
 
 ```typescript
-import { createLogger } from "@yourorg/otel";
+import { createLogger, getTraceContext } from "@yourorg/otel";
 import { NextRequest, NextResponse } from "next/server";
 
 const logger = createLogger("api/users");
@@ -539,12 +735,20 @@ export async function POST(request: NextRequest) {
 
     return NextResponse.json(user);
   } catch (error) {
-    logger.error("User creation failed", {
-      error: error instanceof Error ? error.message : String(error),
-      duration: `${Date.now() - startTime}ms`
-    });
+    const traceId = getTraceContext()?.traceId;
 
-    return NextResponse.json({ error: "Failed" }, { status: 400 });
+    // 3rd argument = the caught error, recorded on the span so Jaeger
+    // marks this span as failed instead of a normal "OK" span.
+    logger.error(
+      "User creation failed",
+      { duration: `${Date.now() - startTime}ms` },
+      error
+    );
+
+    return NextResponse.json(
+      { error: "Failed", traceId },
+      { status: 400, headers: traceId ? { "x-trace-id": traceId } : undefined }
+    );
   }
 }
 ```
@@ -579,9 +783,9 @@ After implementation, you'll have:
 packages/otel/
 ├── package.json                    ✅ Updated
 ├── src/
-│   ├── index.ts                    ✅ Updated
+│   ├── index.ts                    ✅ Updated (exports getTraceContext too)
 │   ├── logger.ts                   ✅ Created
-│   └── log-helper.ts               ✅ Created
+│   └── log-helper.ts               ✅ Created (trace correlation + exceptions)
 
 apps/ibe-app/
 ├── package.json                    ✅ Updated
@@ -591,7 +795,7 @@ apps/ibe-app/
     ├── page.tsx                    ✅ Updated
     └── api/
         └── test-logs/
-            └── route.ts            ✅ Created
+            └── route.ts            ✅ Created (returns x-trace-id header)
 
 apps/top-app/
 ├── package.json                    ✅ Updated
@@ -601,7 +805,10 @@ apps/top-app/
     ├── page.tsx                    ✅ Updated
     └── api/
         └── test-logs/
-            └── route.ts            ✅ Created
+            └── route.ts            ✅ Created (returns x-trace-id header)
+
+otel-collector-config.yaml          ✅ Created (OTLP → batch → Jaeger + debug)
+docker-compose.yml                  ✅ Updated (adds otel-collector service)
 ```
 
 ---
@@ -629,12 +836,36 @@ pnpm install
 2. Make a request: `curl http://localhost:3000/api/test-logs`
 3. Logs should appear in terminal immediately with color codes
 
-### Problem: Jaeger not running
+### Problem: Jaeger / collector not running
 
 **Solution:**
 ```bash
 docker-compose up -d
-docker ps | grep jaeger
+docker ps | grep -E "jaeger|otel-collector"
+```
+
+### Problem: No traces reaching Jaeger after adding the collector
+
+**Solution:**
+1. Check the collector actually started and is healthy:
+   ```bash
+   docker logs otel-collector
+   ```
+   You should see `Starting GRPC server` on `[::]:4317` and, after a
+   request, a `Traces` log line with `resource spans: 1`.
+2. Confirm `jaeger` is healthy before the collector starts — the compose
+   file makes `otel-collector` wait on `jaeger`'s healthcheck.
+3. Apps still point at `localhost:4317` in `.env.local` — that's correct,
+   the collector now owns that port instead of Jaeger.
+
+### Problem: A failed request shows "OK" in Jaeger instead of red/error
+
+**Solution:** You're calling `logger.error(message, attributes)` without
+the 3rd argument. Pass the caught error so the span gets
+`recordException` + `setStatus(ERROR)`:
+```typescript
+logger.error("message", { attrs }, error); // ✅ marks the span failed
+logger.error("message", { attrs });         // ❌ only adds a log event
 ```
 
 ### Problem: Port already in use
@@ -642,15 +873,18 @@ docker ps | grep jaeger
 **Solution:**
 - ibe-app: Change port 3000 in package.json and .env
 - top-app: Change port 3001 in package.json and .env
-- Jaeger: Change ports in docker-compose.yml
+- Jaeger UI / collector: Change ports in docker-compose.yml
 
 ---
 
 ## What You Now Have
 
 ✅ **OTEL Tracing** - Automatic request tracing  
-✅ **Structured Logging** - Serializable JSON format  
+✅ **Structured Logging** - Serializable JSON format (JSON Lines in production)  
 ✅ **Dual Output** - Terminal (color) + Jaeger (spans)  
+✅ **Trace Correlation** - `x-trace-id` response header + trace ID on every log line  
+✅ **Accurate Failure Status** - Failed requests show as errored spans in Jaeger  
+✅ **Swappable Backend** - OTEL Collector decouples apps from Jaeger  
 ✅ **Monorepo Ready** - Shared setup for multiple apps  
 ✅ **Production Ready** - Can scale to any backend  
 

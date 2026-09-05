@@ -12,8 +12,11 @@ A complete, production-ready implementation of **OpenTelemetry** with **structur
 ## ✨ Features
 
 - ✅ **Automatic Tracing** - All HTTP requests traced automatically
-- ✅ **Structured Logging** - Serializable JSON logs with full context
+- ✅ **Structured Logging** - Serializable JSON logs with full context (JSON Lines in production)
 - ✅ **Dual Output** - Color-coded terminal logs + Jaeger span events
+- ✅ **Trace Correlation** - `x-trace-id` response header + trace ID on every log line
+- ✅ **Accurate Error Status** - Failed requests marked as errored spans (`recordException`) in Jaeger
+- ✅ **OTEL Collector** - Sits between apps and Jaeger so the backend can change without touching app code
 - ✅ **Easy API** - Simple `logger.info()`, `logger.error()` etc.
 - ✅ **Monorepo Ready** - Shared OTEL package for multiple apps
 - ✅ **Jaeger Integration** - View traces and logs together
@@ -35,10 +38,12 @@ cd Next-OTEL
 pnpm install
 ```
 
-### 3. Start Jaeger
+### 3. Start Jaeger + OTEL Collector
 ```bash
 docker-compose up -d
 ```
+This starts Jaeger and an OTEL Collector in front of it. Apps send traces to
+the collector (`localhost:4317`), which batches and forwards them to Jaeger.
 
 ### 4. Start Apps
 
@@ -62,16 +67,22 @@ curl http://localhost:3001/api/test-logs
 
 ### 6. View Logs
 
-**Terminal:** Color-coded logs appear instantly
+**Terminal:** Color-coded logs appear instantly, tagged with the trace ID
 ```
-[INFO] 2026-09-05T14:27:25.123Z api/test-logs - GET /api/test-logs called
-[INFO] 2026-09-05T14:27:25.245Z api/test-logs - Request successful
+[INFO] 2026-09-05T14:27:25.123Z api/test-logs - GET /api/test-logs called (trace=220be882e6353f0d7fafc17730fa5152)
+[INFO] 2026-09-05T14:27:25.245Z api/test-logs - Request successful (trace=220be882e6353f0d7fafc17730fa5152)
+```
+
+**Response header:** every response carries the same trace ID
+```bash
+curl -i http://localhost:3000/api/test-logs | grep x-trace-id
 ```
 
 **Jaeger:** Open [http://localhost:16686](http://localhost:16686)
 1. Select service (ibe-app or top-app)
-2. Click "Find Traces"
+2. Click "Find Traces" (or paste the trace ID directly into the search box)
 3. Open a trace and scroll to "Logs" section
+4. A failed request shows as a **red/errored span**, not just a log event
 
 ---
 
@@ -95,7 +106,7 @@ Next-OTEL/
 │       ├── src/
 │       │   ├── index.ts         # Main exports
 │       │   ├── logger.ts        # LoggerProvider setup
-│       │   └── log-helper.ts    # Easy logger API (info, error, warn, debug)
+│       │   └── log-helper.ts    # createLogger() + getTraceContext()
 │       └── package.json
 │
 ├── apps/
@@ -104,7 +115,7 @@ Next-OTEL/
 │   │   ├── .env.local           # Config
 │   │   ├── app/
 │   │   │   ├── page.tsx         # Home page with logging
-│   │   │   └── api/test-logs/   # Test endpoint
+│   │   │   └── api/test-logs/   # Test endpoint (x-trace-id header)
 │   │   └── package.json
 │   │
 │   └── top-app/                 # Example Next.js app 2
@@ -112,10 +123,11 @@ Next-OTEL/
 │       ├── .env.local           # Config (port 3001)
 │       ├── app/
 │       │   ├── page.tsx         # Home page with logging
-│       │   └── api/test-logs/   # Test endpoint
+│       │   └── api/test-logs/   # Test endpoint (x-trace-id header)
 │       └── package.json
 │
-├── docker-compose.yml           # Jaeger setup
+├── otel-collector-config.yaml   # OTLP receiver → batch → Jaeger + debug
+├── docker-compose.yml           # jaeger + otel-collector services
 ├── pnpm-workspace.yaml          # Monorepo config
 └── README.md                    # This file
 ```
@@ -132,7 +144,9 @@ import { createLogger } from "@yourorg/otel";
 const logger = createLogger("feature-name");
 
 logger.info("Operation started");
-logger.error("Something went wrong", { error: error.message });
+// 3rd argument records the exception on the active span (recordException +
+// setStatus ERROR), so it shows as a failed span in Jaeger, not just a log:
+logger.error("Something went wrong", { context: "extra info" }, error);
 logger.warn("Rate limit approaching", { current: 95, limit: 100 });
 logger.debug("Debug details", { data: "value" });
 ```
@@ -140,7 +154,7 @@ logger.debug("Debug details", { data: "value" });
 ### In API Routes
 
 ```typescript
-import { createLogger } from "@yourorg/otel";
+import { createLogger, getTraceContext } from "@yourorg/otel";
 import { NextRequest, NextResponse } from "next/server";
 
 const logger = createLogger("api/users");
@@ -158,10 +172,18 @@ export async function POST(request: NextRequest) {
     });
     return NextResponse.json(user);
   } catch (error) {
-    logger.error("User creation failed", {
-      error: error.message
-    });
-    return NextResponse.json({ error: "Failed" }, { status: 400 });
+    const traceId = getTraceContext()?.traceId;
+
+    logger.error(
+      "User creation failed",
+      { duration: `${Date.now() - startTime}ms` },
+      error
+    );
+
+    return NextResponse.json(
+      { error: "Failed", traceId },
+      { status: 400, headers: traceId ? { "x-trace-id": traceId } : undefined }
+    );
   }
 }
 ```
@@ -304,11 +326,18 @@ For detailed instructions, see [OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md](OTEL_COMP
 pnpm install
 ```
 
-### Jaeger not accessible?
+### Jaeger / collector not accessible?
 ```bash
-docker ps | grep jaeger
+docker ps | grep -E "jaeger|otel-collector"
 docker-compose up -d
 ```
+
+### Traces not reaching Jaeger after adding the collector?
+```bash
+docker logs otel-collector   # look for "Traces" log lines after a request
+```
+Apps still point at `localhost:4317` — that's correct, the collector owns
+that port now and forwards to `jaeger:4317` internally.
 
 See [OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md](OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md#troubleshooting) for more solutions.
 
