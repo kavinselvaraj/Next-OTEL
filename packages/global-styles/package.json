@@ -1,0 +1,9 @@
+{
+  "name": "@yourorg/global-styles",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/globals.css",
+  "dependencies": {
+    "tailwindcss": "^4.0.0"
+  }
+}

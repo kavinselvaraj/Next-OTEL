@@ -1,0 +1,14 @@
+{
+  "name": "@yourorg/otel",
+  "version": "0.0.1",
+  "private": true,
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "dependencies": {
+    "@vercel/otel": "^1.10.0",
+    "@opentelemetry/api": "^1.9.0",
+    "@opentelemetry/resource-detector-aws": "^1.5.2",
+    "@opentelemetry/sdk-logs": "^0.52.0",
+    "@opentelemetry/exporter-logs-otlp-http": "^0.52.0"
+  }
+}
