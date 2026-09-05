@@ -5,6 +5,7 @@ export { getLogger } from "./logger";
 export { createLogger, getTraceContext } from "./log-helper";
 export type { Logger, LogLevel, LogAttributes } from "./log-helper";
 export { runWithCorrelationId, getCorrelationId } from "./correlation";
+export { runWithJourneyId, getJourneyId, tagJourneyStep, tagJourneyStatus } from "./journey";
 
 export function register() {
   initializeLoggerProvider();

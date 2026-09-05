@@ -1,5 +1,6 @@
 import { trace, SpanStatusCode } from "@opentelemetry/api";
 import { getCorrelationId } from "./correlation";
+import { getJourneyId } from "./journey";
 
 export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
@@ -35,6 +36,7 @@ export function createLogger(name: string) {
       const color = colorMap[level];
       const traceContext = getTraceContext();
       const correlationId = getCorrelationId();
+      const journeyId = getJourneyId();
 
       // JSON object for structured logging
       const logObject = {
@@ -42,6 +44,7 @@ export function createLogger(name: string) {
         level,
         logger: name,
         message,
+        ...(journeyId && { journey_id: journeyId }),
         ...(correlationId && { correlation_id: correlationId }),
         ...(traceContext && { trace_id: traceContext.traceId, span_id: traceContext.spanId }),
         ...(attributes && attributes),
@@ -54,6 +57,7 @@ export function createLogger(name: string) {
         // Development: Pretty-printed format with colors
         const prefix = `${color}[${level}]${resetColor}`;
         const idSuffix = [
+          journeyId ? `journey=${journeyId}` : undefined,
           correlationId ? `correlation=${correlationId}` : undefined,
           traceContext ? `trace=${traceContext.traceId}` : undefined,
         ]
