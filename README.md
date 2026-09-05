@@ -92,7 +92,6 @@ curl -i http://localhost:3000/api/test-logs | grep x-trace-id
 |----------|---------|
 | **[OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md](OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md)** | ⭐ **START HERE** - Complete step-by-step setup |
 | [OTEL_SETUP_GUIDE.md](OTEL_SETUP_GUIDE.md) | Monorepo OTEL setup details |
-| [LOGGING_FINAL_SUMMARY.md](LOGGING_FINAL_SUMMARY.md) | Logging implementation summary |
 
 ---
 
