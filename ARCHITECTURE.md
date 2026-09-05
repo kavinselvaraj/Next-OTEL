@@ -175,9 +175,112 @@ sequenceDiagram
 
 ---
 
-## 4. Decisions Behind This Shape
+## 4. Multi-Page Journeys (`journey_id`)
 
-Five decisions define why the architecture looks like this rather than the
+Everything above covers a **single request**. A real booking flow —
+flight search → results → seats → passengers → extras → review → payment →
+completion — is 8 separate page loads, and therefore **8 separate OTEL
+traces**. Neither `trace_id` nor `correlation_id` spans them: both are
+bounded to one request by design.
+
+`journey_id` is the third identifier, with a third lifecycle:
+
+| ID | Scope | Regenerated | Answers |
+|---|---|---|---|
+| `trace_id` | One request | Every request (by OTEL) | "What happened inside *this* request?" |
+| `correlation_id` | One browser→server round trip | Every call | "Which server work belongs to *this* fetch?" |
+| **`journey_id`** | **The whole 8-step flow** | **Once, at flow entry** | **"Show me everything from this customer's booking attempt"** |
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant MW as middleware.ts<br/>(Edge runtime)
+    participant P as Flight page<br/>(Node runtime)
+    participant SVC as Journey Service
+    participant SDK as SDK
+    participant J as Jaeger
+
+    U->>MW: GET /flight/search
+    Note over MW: Entry point - ALWAYS a fresh journey_id,<br/>even over a stale cookie
+    MW->>MW: journeyId = crypto.randomUUID()
+    MW->>MW: request.cookies.set(...) so THIS render sees it
+    MW->>P: forward request
+    Note over P: runWithJourneyId(journeyId, ...)
+    P->>SVC: recordJourneyStep("search")
+    SVC->>SVC: span.setAttribute("journey_id" / "journey_step")
+    SVC->>SDK: callBackend()
+    SDK-->>SVC: data
+    SVC-->>P: result
+    P-->>U: HTML + Set-Cookie: journey_id (45 min TTL)
+    P-)J: trace #1 (tagged journey_id, step=search)
+
+    U->>MW: GET /flight/results (cookie sent automatically)
+    Note over MW: Cookie exists - pass through untouched
+    MW->>P: forward request
+    P->>SVC: recordJourneyStep("results")
+    P-->>U: HTML
+    P-)J: trace #2 (SAME journey_id, step=results)
+
+    Note over U,J: ... steps 3-7 identical ...
+
+    U->>MW: GET /flight/completion
+    MW->>P: forward request
+    P->>SVC: recordJourneyStep("completion")
+    P->>P: tagJourneyStatus(journeyId, "completed")
+    P-)J: trace #8 (SAME journey_id, status=completed)
+
+    Note over J: Tag search journey_id=<id><br/>returns all 8 traces
+```
+
+### Why a cookie, and why middleware
+
+Since these are real page navigations (not SPA routing), `journey_id` must
+be readable **synchronously, server-side, on the first byte of every page** —
+including pages that fetch data during SSR before any client JS runs. That
+rules out `sessionStorage` (client-only). A cookie works, but Next.js
+Server Components **cannot set cookies** — only Route Handlers, Server
+Actions, and middleware can. Hence `middleware.ts`.
+
+The subtle part: middleware mutates **`request.cookies`**, not just the
+response. Setting only the response cookie would mean the very page being
+rendered right now still can't see it — `cookies()` reads the *incoming*
+request. Mutating the request is what lets the entry page's own first
+render read the ID it was just assigned.
+
+### The Edge-runtime constraint
+
+Middleware runs on the Edge runtime, which has **no `async_hooks`** — so
+`middleware.ts` cannot import `@yourorg/otel` at all (both `correlation.ts`
+and `journey.ts` depend on `AsyncLocalStorage`). It does pure cookie logic
+only; all tracing and logging happens once the request reaches a
+Node-runtime page.
+
+This constraint bit once during implementation: adding `middleware.ts`
+caused Next.js to *also* invoke `instrumentation.ts`'s `register()` on the
+Edge runtime, where `@vercel/otel` isn't safe to load — it threw
+`Cannot read properties of undefined (reading 'attributeCountLimit')`. The
+fix is the `process.env.NEXT_RUNTIME === "nodejs"` guard now in both apps'
+`instrumentation.ts`.
+
+### Span attribute, not log field
+
+`correlation_id` is attached to spans as a **log-event field**
+(`span.addEvent(..., { "log.correlation_id": id })`). That's fine when you
+already have the trace open. But Jaeger's tag search matches **span tags**,
+not nested log-event fields — so `journey_id` is set via
+`span.setAttribute()` instead. That single difference is what makes
+`tags={"journey_id":"<id>"}` return all 8 traces rather than nothing.
+
+Each page also tags `journey_step`, and the terminal page tags
+`journey_status=completed`. Beyond debugging one booking, that combination
+makes drop-off analysis queryable: count distinct `journey_id`s with
+`journey_step=payment` versus `journey_step=seats`.
+
+---
+
+## 5. Decisions Behind This Shape
+
+Seven decisions define why the architecture looks like this rather than the
 more obvious alternatives. Each was made explicitly, not by default.
 
 ### Decision 1 — Correlation ID vs. full browser tracing (chosen: correlation ID)
@@ -244,9 +347,40 @@ code or `.env.local` changed to make this swap. The reason: to change or add
 a trace backend (Datadog, CloudWatch, a second Jaeger for a different
 environment) later, only `otel-collector-config.yaml` needs to change.
 
+### Decision 6 — Cookie vs. URL param for `journey_id` (chosen: cookie)
+
+**Rejected alternative:** carry `journey_id` as a query parameter forwarded
+through every link and redirect between the 8 steps.
+
+**Why not:** it's naturally tab-scoped (a real advantage — two tabs booking
+simultaneously wouldn't collide), but it means every one of the 8 pages'
+links, forms, and redirects must remember to forward it. One missed link
+anywhere in the flow silently breaks the chain for that user, with no
+error to signal it happened.
+
+**Why cookie instead:** the browser forwards it automatically on every
+same-origin request — nothing to remember per link. The real cost is a
+narrow edge case: two tabs starting a booking simultaneously would share
+one `journey_id`, since cookies aren't tab-scoped. Confirmed acceptable
+for this project since there's no realistic concurrent-tab booking
+scenario; worth revisiting if that changes.
+
+### Decision 7 — `journey_id` as a span attribute, not a log field
+
+`correlation_id` is attached to spans via `span.addEvent(..., { "log.correlation_id": id })`
+— sufficient once you already have one trace open, since you're reading
+event details inside it. `journey_id` needs something stronger: the entire
+point is finding traces you *don't* already have open, across 8 separate
+ones. Jaeger's tag search matches span-level tags, not fields buried
+inside log events — so `journey_id` is set via `span.setAttribute()`
+instead. Verified directly: querying Jaeger's API with
+`tags={"journey_id":"<id>"}` returned all 8 traces only after switching to
+`setAttribute`; the event-only approach would have returned nothing outside
+a specific trace already known.
+
 ---
 
-## 5. How This Was Actually Built (Chronological)
+## 6. How This Was Actually Built (Chronological)
 
 For context on *why* the code looks the way it does, roughly in the order
 decisions were made:
@@ -283,9 +417,16 @@ decisions were made:
    actual production request pattern (client service / server service / sdk
    / Redux dispatch) rather than a single flat API route.
 
+7. **Extended again to a multi-page journey** — Decisions 6–7 and the
+   `journey_id` mechanism, once it was clear a real booking flow spans many
+   page loads, not one request. Hit and fixed an Edge-runtime bug here too:
+   adding `middleware.ts` made Next.js invoke `instrumentation.ts`'s
+   `register()` on Edge as well as Node, where `@vercel/otel` isn't safe to
+   load — fixed with the `NEXT_RUNTIME === "nodejs"` guard.
+
 ---
 
-## 6. Implementing This in a Real Project
+## 7. Implementing This in a Real Project
 
 A checklist for carrying this pattern into an actual production codebase,
 not just this demo repo.
@@ -353,6 +494,24 @@ endpoint built on this pattern — same steps (direct curl, SSR page, CSR
 DevTools check, Jaeger cross-check, terminal logs, deliberate failure)
 apply regardless of the domain.
 
+### Applying `journey_id` to your actual multi-step flow
+- Set the middleware `matcher` to your real flow's route prefix (e.g.
+  `/checkout/:path*`, `/onboarding/:path*`) — it currently matches
+  `/flight/:path*`.
+- Decide your real entry-point path (the one that always regenerates,
+  never reuses a stale cookie) — currently hardcoded to `/flight/search`.
+- Reconsider the cookie TTL (currently 45 min) against how long your real
+  flow realistically takes to complete.
+- If any step in your real flow redirects to a genuinely external domain
+  (a payment gateway, an identity provider) and back, revisit
+  `SameSite=Lax` — a cross-site round trip may need `SameSite=None; Secure`
+  instead, which has its own browser-compatibility caveats worth testing
+  explicitly rather than assuming.
+- `journey_id` and `journey_step`/`journey_status` are plain random UUIDs
+  and business labels — not PII themselves — but confirm that's still true
+  for your real step names before shipping (e.g. don't let a step name leak
+  a customer identifier).
+
 ---
 
 ## Quick Reference
@@ -363,5 +522,9 @@ apply regardless of the domain.
 | `getTraceContext()` | `packages/otel/src/log-helper.ts` | API route (response headers), anywhere needing the trace ID |
 | `runWithCorrelationId(id, fn)` | `packages/otel/src/correlation.ts` | Wraps the API route handler body |
 | `getCorrelationId()` | `packages/otel/src/correlation.ts` | Read implicitly by `createLogger`, explicitly by `callBackend` |
+| `runWithJourneyId(id, fn)` | `packages/otel/src/journey.ts` | Wraps each flight-flow page's render |
+| `getJourneyId()` | `packages/otel/src/journey.ts` | Read implicitly by `createLogger` |
+| `tagJourneyStep(id, step)` / `tagJourneyStatus(id, status)` | `packages/otel/src/journey.ts` | Called once per page, in `flight-journey-service.ts` / `render-step.tsx` |
 | `callBackend(opts)` | `packages/sdk/src/index.ts` | Server service's only way to reach the backend |
+| `journey_id` cookie logic | `apps/ibe-app/middleware.ts` | Runs before every `/flight/*` page (Edge runtime) |
 | OTEL Collector config | `otel-collector-config.yaml` | The one place to change when swapping trace backends |

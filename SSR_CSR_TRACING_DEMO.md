@@ -1,10 +1,14 @@
 # 🔍 Testing the SSR / CSR Tracing Demo
 
-This walks through verifying the `orders` demo in `apps/ibe-app` — the
-reference implementation of correlation-ID tracing across both the SSR and
-CSR call patterns. See `OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md` for how the
-base OTEL setup works; this doc is specifically about the two request
-patterns and how to confirm each one is wired correctly.
+This walks through verifying two reference implementations in `apps/ibe-app`:
+
+- **§1–6: the `orders` demo** — correlation-ID tracing across a single SSR
+  or CSR request
+- **§7: the `flight/*` demo** — `journey_id` correlation across an 8-page
+  flow (search → ... → completion), where each page is its own trace
+
+See `OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md` for how the base OTEL setup
+works, and `ARCHITECTURE.md` for the design reasoning behind both demos.
 
 ---
 
@@ -136,6 +140,98 @@ Remember to revert `BACKEND_BASE_URL` afterward.
 
 ---
 
+## 7. Verify the Multi-Page Journey (`journey_id`)
+
+This is a different flow entirely — `apps/ibe-app/app/flight/*` (8 pages:
+`search` → `results` → `seats` → `passengers` → `extras` → `review` →
+`payment` → `completion`). Each page load is its own trace; `journey_id` is
+what ties all 8 together. See `ARCHITECTURE.md` §4 for the full design.
+
+### Walk the flow with a cookie jar
+
+```bash
+rm -f /tmp/flight-cookies.txt
+
+# Step 1 - always issues a FRESH journey_id, even over a stale cookie
+curl -s -c /tmp/flight-cookies.txt -D - http://localhost:3000/flight/search -o /tmp/search.html \
+  | grep -i set-cookie
+
+# Steps 2-8 - same journey_id should appear on every page
+for step in results seats passengers extras review payment completion; do
+  echo "=== $step ==="
+  curl -s -b /tmp/flight-cookies.txt -c /tmp/flight-cookies.txt \
+    http://localhost:3000/flight/$step -o /tmp/$step.html
+  grep -o 'journeyId:.\{0,50\}' /tmp/$step.html | head -1
+done
+```
+
+**Confirm:** the same `journeyId` value appears on all 8 pages.
+
+### Verify the fallback path (deep link, no cookie)
+
+```bash
+curl -s -D - http://localhost:3000/flight/seats -o /tmp/deeplink.html | grep -i set-cookie
+grep -o 'fallback journey_id[^<]*' /tmp/deeplink.html
+```
+Expect a **new** cookie to be issued and the page to show the
+"⚠ fallback journey_id" warning — confirming a deep link mid-flow doesn't
+silently pretend to be a normal journey start.
+
+### Verify re-entry issues a fresh journey
+
+```bash
+echo "before:"; grep journey_id /tmp/flight-cookies.txt | awk '{print $7}'
+curl -s -b /tmp/flight-cookies.txt -c /tmp/flight-cookies2.txt http://localhost:3000/flight/search -o /dev/null
+echo "after:"; grep journey_id /tmp/flight-cookies2.txt | awk '{print $7}'
+```
+The two IDs should differ — hitting `/flight/search` again always starts a
+new journey, even with a valid existing cookie.
+
+### Verify the terminal logs
+
+Same as the `orders` demo — but now every line carries `journey=` alongside
+`trace=`, and it's the **same `journey=` value across many different
+`trace=` values**:
+
+```
+[INFO] ... server/flight-journey-service - Journey step: search (journey=abc..., trace=111...)
+[INFO] ... server/flight-journey-service - Journey step: results (journey=abc..., trace=222...)
+[WARN] ... pages/flight-flow - journey_id missing on entry, generated fallback (journey=xyz..., trace=333...)
+[INFO] ... pages/flight-flow - Journey completed (journey=abc..., trace=888...)
+```
+
+### Verify Jaeger's tag search returns all 8 traces
+
+This is the actual point of the feature — a single query pulling up an
+entire booking attempt from 8 separate traces:
+
+```bash
+JID="<paste a journeyId from any /flight/* page>"
+curl -s -G "http://localhost:16686/api/traces" \
+  --data-urlencode "service=ibe-app" \
+  --data-urlencode "tags={\"journey_id\":\"$JID\"}" \
+  --data-urlencode "limit=20" | node -e "
+let raw='';process.stdin.on('data',c=>raw+=c).on('end',()=>{
+const d=JSON.parse(raw);const traces=d.data||[];
+console.log('traces returned:', traces.length);
+for(const t of traces){const steps=new Set(),status=new Set();
+for(const s of t.spans)for(const tag of (s.tags||[])){if(tag.key==='journey_step')steps.add(tag.value);if(tag.key==='journey_status')status.add(tag.value);}
+console.log(' ', t.traceID.slice(0,16), '| step:', [...steps].join(',')||'-', '| status:', [...status].join(',')||'-');}
+});"
+```
+
+Or in the Jaeger UI directly: **Find Traces** → service `ibe-app` → Tags
+field → `journey_id=<id>` → **Find Traces**. Expect **8 results**, one per
+step, with the completion trace additionally tagged `journey_status=completed`.
+
+You can also confirm this the other way, in the Jaeger UI: open any single
+`/flight/*` trace, expand its root span, and check the **Tags** section for
+`journey_id` and `journey_step` — if `journey_id` only appears inside a
+**Logs** event (not as a top-level tag), the tag search above won't find it;
+it needs to be a real span tag, per `ARCHITECTURE.md` Decision 7.
+
+---
+
 ## Quick Reference: Where Each Piece Lives
 
 | Concern | File |
@@ -149,12 +245,23 @@ Remember to revert `BACKEND_BASE_URL` afterward.
 | Client service (browser, no `@yourorg/otel` import) | `apps/ibe-app/app/lib/client/orders-client-service.ts` |
 | Redux thunk (ID survives into error state) | `apps/ibe-app/app/lib/redux/ordersSlice.ts` |
 | CSR demo page | `apps/ibe-app/app/orders/page.tsx` |
+| Journey ID storage (AsyncLocalStorage) + span tagging | `packages/otel/src/journey.ts` |
+| Journey cookie set/forwarded (Edge runtime) | `apps/ibe-app/middleware.ts` |
+| Journey step service (in-process, tags + logs) | `apps/ibe-app/app/lib/server/flight-journey-service.ts` |
+| Shared page renderer for all 8 steps | `apps/ibe-app/app/flight/_lib/render-step.tsx` |
+| The 8 flow pages | `apps/ibe-app/app/flight/{search,results,seats,passengers,extras,review,payment,completion}/page.tsx` |
 
 ---
 
 ## Troubleshooting
 
 **No `x-trace-id` header at all** — the request never reached an instrumented span. Confirm `instrumentation.ts` exists at the app root and exports `register` from `@yourorg/otel`.
+
+**Journey pages throw `Cannot read properties of undefined (reading 'attributeCountLimit')`** — this is the Edge-runtime bug described in `ARCHITECTURE.md` §4: adding `middleware.ts` makes Next.js invoke `instrumentation.ts` on Edge too, and `@vercel/otel` isn't Edge-safe. Confirm `instrumentation.ts` gates the import behind `process.env.NEXT_RUNTIME === "nodejs"`.
+
+**`journey_id` tag search in Jaeger returns 0 results** — confirm `tagJourneyStep`/`tagJourneyStatus` are actually being called (check the terminal logs show `journey=` on that request) and that they use `span.setAttribute()`, not just `span.addEvent()` — only real span tags are searchable this way.
+
+**Same `journey_id` unexpectedly appears across unrelated bookings** — likely two tabs/windows sharing one browser profile hit `/flight/search` around the same time; this is the known cookie tab-collision tradeoff in `ARCHITECTURE.md` Decision 6, not a bug.
 
 **`x-correlation-id` differs between request and response** — shouldn't happen; the route always echoes back what it read (or generated). If it does, check nothing else is stripping/rewriting headers (a proxy, middleware, etc.) between the client and the route.
 
