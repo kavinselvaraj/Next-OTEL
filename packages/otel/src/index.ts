@@ -2,7 +2,7 @@ import { registerOTel } from "@vercel/otel";
 import { initializeLoggerProvider } from "./logger";
 
 export { getLogger } from "./logger";
-export { createLogger } from "./log-helper";
+export { createLogger, getTraceContext } from "./log-helper";
 export type { Logger, LogLevel, LogAttributes } from "./log-helper";
 
 export function register() {

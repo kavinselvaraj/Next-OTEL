@@ -1,4 +1,4 @@
-import { createLogger } from "@yourorg/otel";
+import { createLogger, getTraceContext } from "@yourorg/otel";
 import { NextRequest, NextResponse } from "next/server";
 
 const logger = createLogger("api/test-logs");
@@ -57,17 +57,24 @@ export async function GET(request: NextRequest) {
       }),
     });
 
-    return NextResponse.json(successResponse, { status: 200 });
+    const traceId = getTraceContext()?.traceId;
+
+    return NextResponse.json(successResponse, {
+      status: 200,
+      headers: traceId ? { "x-trace-id": traceId } : undefined,
+    });
   } catch (error) {
     const duration = Date.now() - startTime;
     const errorMessage =
       error instanceof Error ? error.message : String(error);
+    const traceId = getTraceContext()?.traceId;
 
     // Error response structure
     const errorResponse = {
       success: false,
       status: "error",
       requestId,
+      traceId,
       error: {
         message: errorMessage,
         code: "INTERNAL_SERVER_ERROR",
@@ -81,15 +88,23 @@ export async function GET(request: NextRequest) {
       },
     };
 
-    logger.error("Request failed", {
-      requestId,
-      status: 500,
-      error: errorMessage,
-      errorCode: "INTERNAL_SERVER_ERROR",
-      stack: error instanceof Error ? error.stack : undefined,
-      duration: `${duration}ms`,
-    });
+    // Pass the caught error as the 3rd arg so it's recorded on the span
+    // (span.recordException) and the span status is marked ERROR in Jaeger.
+    logger.error(
+      "Request failed",
+      {
+        requestId,
+        status: 500,
+        error: errorMessage,
+        errorCode: "INTERNAL_SERVER_ERROR",
+        duration: `${duration}ms`,
+      },
+      error
+    );
 
-    return NextResponse.json(errorResponse, { status: 500 });
+    return NextResponse.json(errorResponse, {
+      status: 500,
+      headers: traceId ? { "x-trace-id": traceId } : undefined,
+    });
   }
 }

@@ -1,4 +1,4 @@
-import { context, trace } from "@opentelemetry/api";
+import { trace, SpanStatusCode } from "@opentelemetry/api";
 
 export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
@@ -15,11 +15,24 @@ export interface LogAttributes {
   [key: string]: string | number | boolean | undefined | any;
 }
 
+// Returns the active trace/span IDs, or undefined if there is no active span
+// (e.g. code running outside a request context).
+export function getTraceContext(): { traceId: string; spanId: string } | undefined {
+  const span = trace.getActiveSpan();
+  if (!span) return undefined;
+
+  const ctx = span.spanContext();
+  if (!ctx || ctx.traceId === "00000000000000000000000000000000") return undefined;
+
+  return { traceId: ctx.traceId, spanId: ctx.spanId };
+}
+
 export function createLogger(name: string) {
   return {
-    log(level: LogLevel, message: string, attributes?: LogAttributes) {
+    log(level: LogLevel, message: string, attributes?: LogAttributes, err?: unknown) {
       const timestamp = new Date().toISOString();
       const color = colorMap[level];
+      const traceContext = getTraceContext();
 
       // JSON object for structured logging
       const logObject = {
@@ -27,6 +40,7 @@ export function createLogger(name: string) {
         level,
         logger: name,
         message,
+        ...(traceContext && { trace_id: traceContext.traceId, span_id: traceContext.spanId }),
         ...(attributes && attributes),
       };
 
@@ -36,13 +50,15 @@ export function createLogger(name: string) {
       } else {
         // Development: Pretty-printed format with colors
         const prefix = `${color}[${level}]${resetColor}`;
-        console.log(`${prefix} ${timestamp} ${name} - ${message}`);
+        const traceSuffix = traceContext ? ` (trace=${traceContext.traceId})` : "";
+        console.log(`${prefix} ${timestamp} ${name} - ${message}${traceSuffix}`);
         if (attributes && Object.keys(attributes).length > 0) {
           console.log(JSON.stringify(attributes, null, 2));
         }
       }
 
-      // Also add to current span as an event (visible in Jaeger)
+      // Attach to the active span so it's visible in Jaeger, and mark the
+      // span as failed when logging an error with a real Error object.
       try {
         const span = trace.getActiveSpan();
         if (span) {
@@ -52,8 +68,15 @@ export function createLogger(name: string) {
             "log.logger": name,
             ...(attributes && flattenAttributes(attributes)),
           });
+
+          if (level === "ERROR") {
+            if (err instanceof Error) {
+              span.recordException(err);
+            }
+            span.setStatus({ code: SpanStatusCode.ERROR, message });
+          }
         }
-      } catch (error) {
+      } catch (spanError) {
         // Span context might not be available
       }
     },
@@ -62,8 +85,10 @@ export function createLogger(name: string) {
       this.log("INFO", message, attributes);
     },
 
-    error(message: string, attributes?: LogAttributes) {
-      this.log("ERROR", message, attributes);
+    // Pass the caught error as the third argument to record it on the span
+    // (span.recordException) and mark the span status as ERROR.
+    error(message: string, attributes?: LogAttributes, err?: unknown) {
+      this.log("ERROR", message, attributes, err);
     },
 
     warn(message: string, attributes?: LogAttributes) {
