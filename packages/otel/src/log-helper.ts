@@ -21,9 +21,26 @@ export function createLogger(name: string) {
       const timestamp = new Date().toISOString();
       const color = colorMap[level];
 
-      // Console output with color
-      const prefix = `${color}[${level}]${resetColor}`;
-      console.log(`${prefix} ${timestamp} ${name} - ${message}`, attributes || "");
+      // JSON object for structured logging
+      const logObject = {
+        timestamp,
+        level,
+        logger: name,
+        message,
+        ...(attributes && attributes),
+      };
+
+      if (process.env.NODE_ENV === "production") {
+        // Production: JSON Lines format (one JSON object per line) - for CloudWatch, Datadog, etc.
+        console.log(JSON.stringify(logObject));
+      } else {
+        // Development: Pretty-printed format with colors
+        const prefix = `${color}[${level}]${resetColor}`;
+        console.log(`${prefix} ${timestamp} ${name} - ${message}`);
+        if (attributes && Object.keys(attributes).length > 0) {
+          console.log(JSON.stringify(attributes, null, 2));
+        }
+      }
 
       // Also add to current span as an event (visible in Jaeger)
       try {
