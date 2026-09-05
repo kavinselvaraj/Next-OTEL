@@ -1,4 +1,5 @@
 import { trace, SpanStatusCode } from "@opentelemetry/api";
+import { getCorrelationId } from "./correlation";
 
 export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
 
@@ -33,6 +34,7 @@ export function createLogger(name: string) {
       const timestamp = new Date().toISOString();
       const color = colorMap[level];
       const traceContext = getTraceContext();
+      const correlationId = getCorrelationId();
 
       // JSON object for structured logging
       const logObject = {
@@ -40,6 +42,7 @@ export function createLogger(name: string) {
         level,
         logger: name,
         message,
+        ...(correlationId && { correlation_id: correlationId }),
         ...(traceContext && { trace_id: traceContext.traceId, span_id: traceContext.spanId }),
         ...(attributes && attributes),
       };
@@ -50,8 +53,13 @@ export function createLogger(name: string) {
       } else {
         // Development: Pretty-printed format with colors
         const prefix = `${color}[${level}]${resetColor}`;
-        const traceSuffix = traceContext ? ` (trace=${traceContext.traceId})` : "";
-        console.log(`${prefix} ${timestamp} ${name} - ${message}${traceSuffix}`);
+        const idSuffix = [
+          correlationId ? `correlation=${correlationId}` : undefined,
+          traceContext ? `trace=${traceContext.traceId}` : undefined,
+        ]
+          .filter(Boolean)
+          .join(", ");
+        console.log(`${prefix} ${timestamp} ${name} - ${message}${idSuffix ? ` (${idSuffix})` : ""}`);
         if (attributes && Object.keys(attributes).length > 0) {
           console.log(JSON.stringify(attributes, null, 2));
         }
@@ -66,6 +74,7 @@ export function createLogger(name: string) {
             "log.message": message,
             "log.level": level,
             "log.logger": name,
+            ...(correlationId && { "log.correlation_id": correlationId }),
             ...(attributes && flattenAttributes(attributes)),
           });
 

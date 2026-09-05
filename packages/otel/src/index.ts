@@ -4,6 +4,7 @@ import { initializeLoggerProvider } from "./logger";
 export { getLogger } from "./logger";
 export { createLogger, getTraceContext } from "./log-helper";
 export type { Logger, LogLevel, LogAttributes } from "./log-helper";
+export { runWithCorrelationId, getCorrelationId } from "./correlation";
 
 export function register() {
   initializeLoggerProvider();
