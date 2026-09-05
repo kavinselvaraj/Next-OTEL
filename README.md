@@ -93,6 +93,7 @@ curl -i http://localhost:3000/api/test-logs | grep x-trace-id
 | **[OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md](OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md)** | ⭐ **START HERE** - Complete step-by-step setup |
 | [OTEL_SETUP_GUIDE.md](OTEL_SETUP_GUIDE.md) | Monorepo OTEL setup details |
 | [SSR_CSR_TRACING_DEMO.md](SSR_CSR_TRACING_DEMO.md) | How to verify the SSR/CSR correlation-ID tracing demo (`/orders`, `/orders-ssr`) |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Sequence diagrams, design decisions, and a checklist for adopting this in a real project |
 
 ---
 
