@@ -93,6 +93,7 @@ curl -i http://localhost:3000/api/test-logs | grep x-trace-id
 | **[OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md](OTEL_COMPLETE_IMPLEMENTATION_GUIDE.md)** | ⭐ **START HERE** - Complete step-by-step setup |
 | [SSR_CSR_TRACING_DEMO.md](SSR_CSR_TRACING_DEMO.md) | How to verify the correlation-ID demo (`/orders`, `/orders-ssr`) and the `journey_id` multi-page demo (`/flight/*`) |
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Sequence diagrams, design decisions (including `journey_id`), and a checklist for adopting this in a real project |
+| [TRACING_IDS_EXPLAINED.md](TRACING_IDS_EXPLAINED.md) | 🎓 Team onboarding doc — `trace_id` vs `correlation_id` vs `journey_id`, with analogies, diagrams, and hands-on examples |
 
 ---
 
