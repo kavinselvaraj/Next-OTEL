@@ -5,41 +5,79 @@ const logger = createLogger("api/test-logs");
 
 export async function GET(request: NextRequest) {
   const startTime = Date.now();
+  const requestId = crypto.randomUUID();
 
   logger.info("GET /api/test-logs called", {
     method: request.method,
     url: request.url,
     userAgent: request.headers.get("user-agent"),
+    requestId,
   });
 
   try {
-    const data = {
-      message: "Logs are working!",
-      timestamp: new Date().toISOString(),
-      status: "success",
+    // Simulate some processing
+    await new Promise((resolve) => setTimeout(resolve, 50));
+
+    const duration = Date.now() - startTime;
+
+    // Success response structure
+    const successResponse = {
+      success: true,
+      status: "completed",
+      requestId,
+      data: {
+        message: "Logs are working perfectly!",
+        timestamp: new Date().toISOString(),
+        message_type: "info",
+      },
+      metadata: {
+        duration: `${duration}ms`,
+        responseTime: duration,
+        statusCode: 200,
+      },
     };
 
-    const duration = Date.now() - startTime;
-
     logger.info("Request successful", {
+      requestId,
       status: 200,
-      dataSize: JSON.stringify(data).length,
+      dataSize: JSON.stringify(successResponse).length,
       duration: `${duration}ms`,
+      message: "Logs are working perfectly!",
     });
 
-    return NextResponse.json(data);
+    return NextResponse.json(successResponse, { status: 200 });
   } catch (error) {
     const duration = Date.now() - startTime;
+    const errorMessage =
+      error instanceof Error ? error.message : String(error);
+
+    // Error response structure
+    const errorResponse = {
+      success: false,
+      status: "error",
+      requestId,
+      error: {
+        message: errorMessage,
+        code: "INTERNAL_SERVER_ERROR",
+        details: error instanceof Error ? error.stack : undefined,
+      },
+      metadata: {
+        duration: `${duration}ms`,
+        responseTime: duration,
+        statusCode: 500,
+        timestamp: new Date().toISOString(),
+      },
+    };
 
     logger.error("Request failed", {
-      error: error instanceof Error ? error.message : String(error),
+      requestId,
+      status: 500,
+      error: errorMessage,
+      errorCode: "INTERNAL_SERVER_ERROR",
       stack: error instanceof Error ? error.stack : undefined,
       duration: `${duration}ms`,
     });
 
-    return NextResponse.json(
-      { error: "Internal Server Error" },
-      { status: 500 }
-    );
+    return NextResponse.json(errorResponse, { status: 500 });
   }
 }
