@@ -12,9 +12,10 @@ interface OrdersState {
   status: "idle" | "loading" | "succeeded" | "failed";
   error?: string;
   // Carried through from the client service / API route response so a
-  // failed request can be reported with something traceable, the same way
-  // the x-trace-id response header works for direct API testing.
-  correlationId?: string;
+  // failed request can be reported with something traceable. This traceId
+  // is the client-generated `traceparent` trace-id, extracted by the
+  // server and returned unchanged as x-trace-id - not a separate
+  // correlation concept.
   traceId?: string;
 }
 
@@ -25,12 +26,12 @@ const initialState: OrdersState = {
 
 // The dispatch-triggered call lives in this thunk, not in a component or
 // the reducer - `dispatch(fetchOrders())` is synchronous, the actual fetch
-// (and the correlation ID it generates) happens inside here.
+// (and the traceparent it generates) happens inside here.
 //
 // rejectWithValue (rather than throwing) is what lets a *server-reported*
 // failure (success: false, but a valid response with a traceId) surface
-// its correlationId/traceId into the rejected action's payload, so the UI
-// can show "something failed - ref: <traceId>" instead of losing it.
+// its traceId into the rejected action's payload, so the UI can show
+// "something failed - ref: <traceId>" instead of losing it.
 export const fetchOrders = createAsyncThunk(
   "orders/fetch",
   async (_: void, { rejectWithValue }) => {
@@ -55,17 +56,15 @@ const ordersSlice = createSlice({
       .addCase(fetchOrders.fulfilled, (state, action) => {
         state.status = "succeeded";
         state.orders = action.payload.orders ?? [];
-        state.correlationId = action.payload.correlationId;
         state.traceId = action.payload.traceId;
       })
       .addCase(fetchOrders.rejected, (state, action) => {
         state.status = "failed";
         // action.payload is set when the thunk called rejectWithValue
-        // (a server-reported failure, with IDs); otherwise this was a
-        // network-level failure with no server response to read IDs from.
+        // (a server-reported failure, with a traceId); otherwise this was
+        // a network-level failure with no server response to read one from.
         const payload = action.payload as OrdersResponse | undefined;
         state.error = payload?.error ?? action.error.message ?? "Unknown error";
-        state.correlationId = payload?.correlationId;
         state.traceId = payload?.traceId;
       });
   },

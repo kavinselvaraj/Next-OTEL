@@ -1,9 +1,14 @@
-# 📖 Understanding trace_id, correlation_id, and journey_id
+# 📖 Understanding trace_id, traceparent, external_correlation_id, and journey_id
 
 A teaching doc for the team — written for anyone joining fresh, no prior
 tracing/observability background assumed. By the end you should be able to
-explain, in your own words, why we need **three** different IDs instead of
-just one, and point to exactly where each one lives in this codebase.
+explain, in your own words, why we need **four** different concepts instead
+of just one, and point to exactly where each one lives in this codebase.
+
+> If you read an earlier version of this doc: `correlation_id` (a custom
+> browser→server header) has been replaced by `traceparent` (§3) for
+> systems we control, and renamed to `external_correlation_id` (§3a) for
+> systems we don't. See `ARCHITECTURE.md` Decision 1 for why.
 
 ---
 
@@ -11,9 +16,10 @@ just one, and point to exactly where each one lives in this codebase.
 
 1. [The Problem, Before Any IDs Exist](#1-the-problem-before-any-ids-exist)
 2. [trace_id — "What happened in this one request?"](#2-trace_id--what-happened-in-this-one-request)
-3. [correlation_id — "Which server work belongs to this browser action?"](#3-correlation_id--which-server-work-belongs-to-this-browser-action)
+3. [traceparent — "Let the browser hand the server a real trace_id"](#3-traceparent--let-the-browser-hand-the-server-a-real-trace_id)
+   - [3a. external_correlation_id — "For systems that don't play along"](#3a-external_correlation_id--for-systems-that-dont-play-along)
 4. [journey_id — "Show me this whole multi-step flow"](#4-journey_id--show-me-this-whole-multi-step-flow)
-5. [All Three Together](#5-all-three-together)
+5. [All Four Together](#5-all-four-together)
 6. [Side-by-Side Comparison](#6-side-by-side-comparison)
 7. [Where to Find Each One in Our Code](#7-where-to-find-each-one-in-our-code)
 8. [FAQ](#8-faq)
@@ -30,16 +36,16 @@ dozens of servers, one specific attempt by one specific user failed, at
 some unknown point, for some unknown reason. Finding it is close to
 impossible.
 
-Every ID in this document exists to answer one question, at a different
-scale:
+Every concept in this document exists to answer one question, at a
+different scale:
 
 | Question | Scale | Answer |
 |---|---|---|
-| "What exactly happened during **this one request**?" | One request | `trace_id` |
-| "Which server-side work belongs to **this one browser click**?" | One browser→server round trip | `correlation_id` |
+| "What exactly happened during **this one request**, across every system we control?" | One request | `trace_id` (via `traceparent`) |
+| "What did we send to **this external vendor**, on this one call?" | One outbound call to a system we don't control | `external_correlation_id` |
 | "Show me **everything** across this user's whole booking attempt" | Many requests, over minutes | `journey_id` |
 
-None of them replace the others. A real request in our system carries
+None of them replace the others. A real request in our system can carry
 **more than one of these at the same time**, because they solve different
 problems.
 
@@ -117,30 +123,41 @@ network call to the backend, with exact timing for each.
 Refresh the page, and you get a **new** `trace_id`. It cannot follow a user
 across multiple page loads, and it **does not exist yet** for anything
 happening in the browser before the request reaches our server — there's
-no OTEL SDK running client-side. That gap is what `correlation_id` solves.
+no OTEL SDK running client-side. That gap is what `traceparent` (§3)
+closes — surprisingly, without needing a full browser tracer after all.
 
 ---
 
-## 3. `correlation_id` — "Which server work belongs to this browser action?"
+## 3. `traceparent` — "Let the browser hand the server a real trace_id"
 
 ### The analogy
 
-Think of the **receipt number** printed the instant you place an order at
-a counter — *before* the kitchen ticket even exists. If your food is wrong,
-you don't know the kitchen's internal ticket number; you only have your
-receipt. Staff use your receipt number to go find the matching kitchen
-ticket. Two different numbers, same order, created by two different
-systems, at two different moments.
+Imagine a courier service where, normally, the sorting depot stamps a new
+tracking number on every package the moment it arrives. But suppose the
+*sender* is allowed to pre-print their own tracking number on the package
+before it ever reaches the depot — using the depot's own numbering format.
+The depot sees a properly formatted number already there and just
+**continues using it**, instead of stamping a new one. The package's whole
+journey — sender, depot, next depot, final delivery truck — is now
+trackable under **one number**, chosen by the sender, not invented partway
+through.
 
-### Why `trace_id` alone isn't enough here
+### The problem this solves
 
-A button click in the browser (`/orders` page → "Fetch Orders") happens
-**before** any `trace_id` exists — the trace only starts once the request
-lands on our server. If something goes wrong purely on the browser side
-(the fetch never even leaves, say), there's no `trace_id` to find at all.
+Section 2 said `trace_id` only starts once a request reaches our server —
+there's no OTEL SDK in the browser, so a browser click has no `trace_id`
+yet. The obvious fix would be "put a real OTEL tracer in the browser" — but
+that costs bundle size, needs special network configuration (CORS) for the
+browser to talk to the tracing backend, and exposes infrastructure that's
+normally kept internal.
 
-`correlation_id` is generated **in the browser, before the request is
-sent** — so it exists independently of whether a trace ever gets created.
+`traceparent` is the surprising middle ground: **you don't need a real
+tracer to hand over a real trace_id.** The W3C standard for propagating
+trace context doesn't check whether the sender was "really" tracing
+anything — it just reads a correctly formatted value and uses it. So the
+browser can *format* a valid trace_id by hand (using nothing but
+`crypto.randomUUID()`) and the server will treat it as if it always was the
+trace_id — because, as far as OTEL is concerned, it is.
 
 ### Diagram
 
@@ -149,53 +166,142 @@ sequenceDiagram
     participant U as User (browser)
     participant CS as Client Service
     participant API as API Route (server)
+    participant J as Jaeger
 
     U->>CS: clicks "Fetch Orders"
-    CS->>CS: 🎟️ correlationId = crypto.randomUUID()<br/>(created BEFORE any server request)
-    CS->>API: GET /api/orders<br/>header: x-correlation-id
-    Note over API: 🎫 trace_id created HERE,<br/>the moment OTEL sees the request
-    API-->>CS: response with BOTH ids
-    Note over CS: correlationId and traceId now<br/>both point to this exact call
+    CS->>CS: 🎫 traceparent = "00-&lt;32 hex&gt;-&lt;16 hex&gt;-01"<br/>(hand-formatted, no real tracer involved)
+    CS->>API: GET /api/orders<br/>header: traceparent
+    Note over API: @vercel/otel extracts this<br/>BEFORE the handler even runs
+    API-->>CS: x-trace-id == the browser's own trace-id
+    API-)J: trace recorded under<br/>the browser-chosen trace_id
 ```
 
 ### In our code
 
 ```typescript
-// apps/ibe-app/app/lib/client/orders-client-service.ts (runs in the BROWSER)
-export async function fetchOrdersFromClient(): Promise<OrdersResponse> {
-  const correlationId = crypto.randomUUID();  // ← created here, client-side, before any request
-
-  const response = await fetch("/api/orders", {
-    headers: { "x-correlation-id": correlationId },
-  });
-  // ...
+// packages/otel/src/trace-context.ts (dependency-free, browser-safe)
+export function generateTraceparent(): string {
+  const traceId = randomHex(32);
+  const parentId = randomHex(16);
+  return `00-${traceId}-${parentId}-01`;
 }
 ```
 
 ```typescript
-// apps/ibe-app/app/api/orders/route.ts (runs on the SERVER)
-const correlationId = request.headers.get("x-correlation-id") ?? crypto.randomUUID();
-return runWithCorrelationId(correlationId, async () => {
-  // every log line in here automatically includes this correlationId
-});
+// apps/ibe-app/app/lib/client/orders-client-service.ts (runs in the BROWSER)
+import { generateTraceparent } from "@yourorg/otel/src/trace-context";
+
+export async function fetchOrdersFromClient(): Promise<OrdersResponse> {
+  const traceparent = generateTraceparent();  // created here, before any request
+  const response = await fetch("/api/orders", { headers: { traceparent } });
+  // ...
+}
 ```
 
-> ⚠️ Important detail: `orders-client-service.ts` **cannot** import
-> `@yourorg/otel` — that package uses Node's `async_hooks`, which doesn't
-> exist in a browser. `correlation_id` generation on the client is
-> deliberately just plain `crypto.randomUUID()`, nothing OTEL-specific.
+Nothing needs to change on the server at all — `@vercel/otel`'s existing
+auto-instrumentation already extracts an incoming `traceparent` header.
+`getTraceContext()?.traceId` inside the API route now simply *is* the
+value the browser generated.
 
-### See it live
+> ⚠️ Same rule as before: `orders-client-service.ts` imports
+> `generateTraceparent` from `@yourorg/otel/src/trace-context` — a specific
+> subpath with zero Node dependencies — never `@yourorg/otel`'s main entry,
+> which pulls in `@vercel/otel` and breaks in a browser bundle.
 
-Open DevTools Network tab, click **Fetch Orders** on `/orders`, inspect the
-request — you'll see `x-correlation-id` sent by the browser, and the same
-value echoed back in the response, alongside a fresh `x-trace-id`.
+### See it live — proven, not just claimed
 
-### The limit of `correlation_id`
+```bash
+curl -i http://localhost:3000/api/orders \
+  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+# x-trace-id: 4bf92f3577b34da6a3ce929d0e0e4736   ← exactly what we sent
+```
+Search that trace-id in Jaeger and you'll find a **fully populated trace**
+— every span, exactly as if a real request had generated it normally.
 
-It's still scoped to **one request** — generated fresh every time you call
-`/api/orders`. It doesn't help if you need to tie together 8 *different*
-requests across 8 *different* page loads. That's what `journey_id` solves.
+### Why this replaced the old `x-correlation-id` approach
+
+An earlier version of this system used a custom `x-correlation-id` header
+instead. It worked, but Jaeger had no idea what to do with it — it was just
+a string you had to search for manually. `traceparent` gives the exact same
+browser→server linkage, except it becomes the **real trace_id**, and — this
+is the part that matters most in a company with more than one
+language/team — it **automatically continues into any other OTEL-instrumented
+service** downstream (a Java backend, for example) with zero extra code,
+because that's what the W3C standard is *for*.
+
+### The limit of `traceparent`
+
+It only helps for systems that **run OTEL and extract it** — your own
+services. A third-party vendor system almost certainly won't. That gap is
+what §3a covers next.
+
+---
+
+## 3a. `external_correlation_id` — "For systems that don't play along"
+
+### The analogy
+
+You ship a package through your own courier network (tracking number
+included, everyone along the way honors it) — but the *final leg* is
+handed off to a completely different company that has its own separate
+tracking system and has never heard of yours. You still write your
+tracking number on the handoff paperwork, but you can't expect their
+system to adopt it — it's just a note on *your* copy of the paperwork, so
+if something goes wrong, you at least know which of their shipments was
+yours.
+
+### Why `traceparent` doesn't help here
+
+`traceparent` only works if **both sides** understand it. A vendor
+integration — an airline PSS (Passenger Service System), a payment
+gateway, any third-party API — almost certainly doesn't run OTEL and won't
+extract or forward anything from the header. Sending it `traceparent` costs
+nothing, but it also gains nothing.
+
+### What we do instead
+
+Generate a plain ID, right before calling that specific external system,
+and log it on **our own side** — so even if the vendor ignores it
+completely, we still have a durable record: "we sent them this exact ID,
+on this exact request, at this exact time."
+
+### Diagram
+
+```mermaid
+sequenceDiagram
+    participant SVC as Our Server Service
+    participant SDK as SDK (callExternalSystem)
+    participant PSS as External PSS/POP<br/>(doesn't run OTEL)
+
+    Note over SVC: Only right before the external call
+    SVC->>SVC: 🏷️ externalCorrelationId = crypto.randomUUID()
+    SVC->>SDK: callExternalSystem({ path })
+    SDK->>PSS: fetch + x-external-correlation-id header
+    Note over PSS: May ignore this entirely - that's fine,<br/>it's for OUR records, not theirs
+    PSS-->>SDK: response
+    Note over SDK: We log this ID on OUR side regardless
+```
+
+### In our code
+
+```typescript
+// apps/ibe-app/app/lib/server/flight-journey-service.ts
+if (step === "payment") {
+  const externalCorrelationId = crypto.randomUUID();
+  await runWithExternalCorrelationId(externalCorrelationId, async () => {
+    await callExternalSystem({ path: "/posts/1" }); // stand-in for a real PSS/POP call
+  });
+}
+```
+
+### `correlation_id` vs `external_correlation_id` — same mechanism, different job
+
+If this looks familiar to an older version of this doc: it is the same
+`AsyncLocalStorage` pattern that used to be called `correlation_id` for the
+browser→server boundary. Once `traceparent` took over that job (§3), the
+mechanism was renamed and rescoped specifically to **calls that leave our
+own systems entirely** — `packages/otel/src/external-correlation.ts`. Same
+tool, deliberately narrowed to the one problem `traceparent` can't solve.
 
 ---
 
@@ -210,19 +316,21 @@ reservation number ties the *entire trip* together. If your bag gets lost,
 an agent doesn't need to know which of the three flight numbers it was on —
 they search by your one reservation number and see the whole itinerary.
 
-### Why `trace_id` and `correlation_id` aren't enough here
+### Why `trace_id` isn't enough here
 
 Our real flight-booking flow is **8 separate page loads**:
 `search → results → seats → passengers → extras → review → payment → completion`.
-Each page load is its own request, so it gets its **own** `trace_id`. There
-is no way to make one `trace_id` span 8 page loads over several minutes —
-and you wouldn't want to: a trace is meant to be one bounded operation
-lasting milliseconds, not a multi-minute user session. Forcing that would
-make the trace view in Jaeger unreadable.
+Each page load is its own request, so it gets its **own** `trace_id` (or
+its own `traceparent`, if generated client-side per page). There is no way
+to make one `trace_id` span 8 page loads over several minutes — and you
+wouldn't want to: a trace is meant to be one bounded operation lasting
+milliseconds, not a multi-minute user session. Forcing that would make the
+trace view in Jaeger unreadable.
 
 `journey_id` solves this by being generated **once**, then deliberately
-**reused** across all 8 requests — the opposite of `trace_id` and
-`correlation_id`, which are regenerated every time.
+**reused** across all 8 requests — the opposite of `trace_id`, which is
+fresh every time (whether server-generated or handed over via
+`traceparent`).
 
 ### Diagram
 
@@ -296,9 +404,9 @@ if (isFlowEntryPoint || !existingId) {
 }
 ```
 
-> ⚠️ Same rule as `correlation_id`'s client service: `middleware.ts` runs
-> on the **Edge runtime**, which also has no `async_hooks`. It must never
-> import `@yourorg/otel` — it only does plain cookie logic.
+> ⚠️ Same rule as the browser's client service: `middleware.ts` runs on
+> the **Edge runtime**, which also has no `async_hooks`. It must never
+> import `@yourorg/otel`'s main entry — it only does plain cookie logic.
 
 ### The one detail that makes this actually useful
 
@@ -323,49 +431,53 @@ curl -G "http://localhost:16686/api/traces" \
 
 ---
 
-## 5. All Three Together
+## 5. All Four Together
 
-Here's a single CSR request inside the flight flow, showing all three IDs
-doing their separate jobs at once:
+Here's the flight flow's payment step, showing all four IDs doing their
+separate jobs at once — this is the one step where every concept in this
+doc is active simultaneously:
 
 ```mermaid
 sequenceDiagram
     participant U as User (browser)
-    participant CS as Client Service
     participant MW as middleware.ts
-    participant API as API/Page (server)
+    participant API as Payment Page (server)
+    participant PSS as External PSS/POP
     participant J as Jaeger
 
     Note over U: 🧳 journey_id already sitting<br/>in a cookie from step 1
-    U->>CS: interacts with a page mid-flow
-    CS->>CS: 🎟️ correlationId = crypto.randomUUID()<br/>(fresh, for THIS request only)
-    CS->>MW: request (cookie sent automatically:<br/>journey_id + x-correlation-id header)
+    U->>MW: GET /flight/payment (cookie sent automatically)
     MW->>API: forward
-    Note over API: 🎫 trace_id created HERE by OTEL
-    API->>API: tagJourneyStep(journeyId, step)<br/>logger.info(msg, { correlationId })
-    API-)J: span tagged: journey_id, journey_step<br/>log carries: correlation_id, trace_id
-    API-->>U: response: correlationId + traceId
+    Note over API: 🎫 trace_id for THIS page load<br/>(created by OTEL, or handed over<br/>via traceparent if this were CSR)
+    API->>API: tagJourneyStep(journeyId, "payment")
+    API->>API: 🏷️ externalCorrelationId = crypto.randomUUID()<br/>(fresh, for the PSS call only)
+    API->>PSS: fetch + x-external-correlation-id
+    PSS-->>API: response
+    API-)J: span tagged: journey_id, journey_step<br/>log carries: journey_id, external_correlation_id, trace_id
+    API-->>U: rendered page
 ```
 
-At this single moment, all three exist simultaneously:
-- **`trace_id`** — unique to this exact request
-- **`correlation_id`** — unique to this exact browser action
-- **`journey_id`** — shared with 7 other requests before/after this one
+At this single moment, all four exist simultaneously:
+- **`trace_id`** — unique to this exact page load
+- **`traceparent`** — the mechanism that *would* have carried `trace_id` in from the browser, had this been a CSR call (§3)
+- **`external_correlation_id`** — unique to this exact call to PSS, scoped narrowly to just that one outbound request
+- **`journey_id`** — shared with 7 other page loads before/after this one
 
 ---
 
 ## 6. Side-by-Side Comparison
 
-| | `trace_id` | `correlation_id` | `journey_id` |
+| | `trace_id` (via `traceparent`) | `external_correlation_id` | `journey_id` |
 |---|---|---|---|
-| **Created by** | OpenTelemetry, automatically | Our code, in the browser or SSR page | Our code, in `middleware.ts` |
-| **Created when** | The moment a request hits instrumented code | Before the request is even sent | Once, at the very first step of a flow |
-| **Regenerated** | Every single request | Every single request | Only at the flow's entry point |
-| **Lives in** | OTEL's internal span context | An HTTP header (`x-correlation-id`) | A cookie (`journey_id`) |
+| **Created by** | The browser or SSR page (hand-formatted), or OTEL itself if none was sent | Our code, immediately before calling an external system | Our code, in `middleware.ts` |
+| **Created when** | Before the request is sent (if client-generated) | Right before the one external call | Once, at the very first step of a flow |
+| **Regenerated** | Every single request | Every single external call | Only at the flow's entry point |
+| **Lives in** | The `traceparent` HTTP header, then OTEL's internal span context | An HTTP header (`x-external-correlation-id`) | A cookie (`journey_id`) |
 | **Survives a page reload?** | No — new one every time | No — new one every time | **Yes** — that's the whole point |
-| **Where it's stored in code** | `packages/otel/src/log-helper.ts` | `packages/otel/src/correlation.ts` | `packages/otel/src/journey.ts` |
+| **Continues into other OTEL services automatically?** | **Yes** — that's the whole point of the W3C standard | No — the external system likely doesn't run OTEL at all | N/A (not a trace concept) |
+| **Where it's stored in code** | `packages/otel/src/trace-context.ts` (generate) / `log-helper.ts` (read) | `packages/otel/src/external-correlation.ts` | `packages/otel/src/journey.ts` |
 | **Searchable in Jaeger by tag?** | Yes (it's the trace itself) | No (it's inside log events, not a span tag) | **Yes** (set via `span.setAttribute`) |
-| **Answers** | "What happened in this one request?" | "Which server work is this one browser click?" | "Show me this user's whole flow" |
+| **Answers** | "What happened in this one request, across every system we control?" | "What did we send to this external vendor, on this call?" | "Show me this user's whole flow" |
 
 ---
 
@@ -374,17 +486,21 @@ At this single moment, all three exist simultaneously:
 | Concept | File | What to look for |
 |---|---|---|
 | `trace_id` read | `packages/otel/src/log-helper.ts` | `getTraceContext()` |
-| `correlation_id` storage | `packages/otel/src/correlation.ts` | `runWithCorrelationId()` / `getCorrelationId()` |
-| `correlation_id` generated (browser) | `apps/ibe-app/app/lib/client/orders-client-service.ts` | `crypto.randomUUID()` |
-| `correlation_id` generated (SSR) | `apps/ibe-app/app/orders-ssr/page.tsx` | `crypto.randomUUID()` |
-| `correlation_id` survives failure | `apps/ibe-app/app/lib/redux/ordersSlice.ts` | `rejectWithValue(result)` |
+| `traceparent` generated (browser-safe) | `packages/otel/src/trace-context.ts` | `generateTraceparent()` — import via `/src/trace-context` subpath |
+| `traceparent` sent (browser) | `apps/ibe-app/app/lib/client/orders-client-service.ts` | `traceparent` header on `fetch` |
+| `traceparent` sent (SSR) | `apps/ibe-app/app/orders-ssr/page.tsx` | `traceparent` header on `fetch` |
+| `trace_id` survives failure | `apps/ibe-app/app/lib/redux/ordersSlice.ts` | `rejectWithValue(result)` |
+| `external_correlation_id` storage | `packages/otel/src/external-correlation.ts` | `runWithExternalCorrelationId()` / `getExternalCorrelationId()` |
+| `external_correlation_id` used | `apps/ibe-app/app/lib/server/flight-journey-service.ts` (payment step) | `runWithExternalCorrelationId()` wrapping `callExternalSystem()` |
+| Our backend vs external system, side by side | `packages/sdk/src/index.ts` | `callBackend()` (no correlation code) vs `callExternalSystem()` (explicit header) |
 | `journey_id` storage + tagging | `packages/otel/src/journey.ts` | `runWithJourneyId()`, `tagJourneyStep()`, `tagJourneyStatus()` |
 | `journey_id` cookie logic | `apps/ibe-app/middleware.ts` | Edge runtime, sets/forwards the cookie |
 | `journey_id` used per page | `apps/ibe-app/app/flight/_lib/render-step.tsx` | Reads the cookie, wraps the page |
 
-For the full design reasoning (why a cookie, why span attributes, the
-Edge-runtime bug we hit along the way), see `ARCHITECTURE.md`. For
-step-by-step verification commands, see `SSR_CSR_TRACING_DEMO.md`.
+For the full design reasoning (why `traceparent` over a custom header, why
+a cookie for `journey_id`, why span attributes, the Edge-runtime bug we hit
+along the way), see `ARCHITECTURE.md`. For step-by-step verification
+commands, see `SSR_CSR_TRACING_DEMO.md`.
 
 ---
 
@@ -395,25 +511,38 @@ A: We don't create it — we just *read* it (`getTraceContext()`) so we can
 show it to the user, put it in a response header, or include it in a log
 line. OTEL does the actual creation.
 
-**Q: Could we just use `correlation_id` for everything, and skip `trace_id`?**
-A: No — `trace_id` is what OTEL's whole tracing system (spans, timing,
-the Jaeger waterfall view) is built around. `correlation_id` is a plain
-string with no automatic timing or waterfall behind it; it's only useful
-for *searching and matching*, not for seeing *how long each step took*.
+**Q: Why not just use a custom header for everything, like the old `correlation_id` did?**
+A: We tried that first! It worked for tying one browser click to one server
+request, but Jaeger had no idea what to do with a custom string — you had
+to search log messages by hand. `traceparent` gives the same linkage but
+becomes the *real* `trace_id`, with automatic propagation into any other
+OTEL-instrumented service (a Java backend, for example) for free. See
+`ARCHITECTURE.md` Decision 1 for the full story of why this changed.
 
-**Q: Could we just use `journey_id` for every request, and skip `trace_id`/`correlation_id`?**
+**Q: If `traceparent` is so much better, why does `external_correlation_id` still exist?**
+A: Because `traceparent` only helps when *both* sides understand it. A
+third-party vendor (PSS/POP, a payment gateway) almost certainly doesn't
+run OTEL — sending it `traceparent` costs nothing but gains nothing either.
+`external_correlation_id` exists specifically for that one remaining gap:
+systems we don't control and can't assume anything about.
+
+**Q: Could we just use `journey_id` for every request, and skip `trace_id`?**
 A: No — if you reused `journey_id` as the trace ID for every single request
 in an 8-page flow, Jaeger would try to draw one giant trace spanning
 several minutes across 8 unrelated page loads, which produces an unusable
 waterfall. Keeping them separate is deliberate.
 
-**Q: Why can't the client service (browser) or middleware import `@yourorg/otel`?**
+**Q: Why can't the client service (browser) or middleware import `@yourorg/otel`'s main entry?**
 A: Both run in environments without Node's `async_hooks` — the browser
 entirely lacks it, and Next.js middleware runs on the Edge runtime, which
-also lacks it. `@yourorg/otel`'s `correlation.ts` and `journey.ts` both
-depend on `AsyncLocalStorage`, which is built on `async_hooks`. Importing
-it in either place will break at runtime (we hit exactly this bug with
-`@vercel/otel` on the Edge runtime — see `ARCHITECTURE.md` §4).
+also lacks it. `@yourorg/otel`'s `external-correlation.ts` and `journey.ts`
+both depend on `AsyncLocalStorage`, which is built on `async_hooks`, and
+the main entry (`index.ts`) also eagerly imports `@vercel/otel` (Node-only).
+Importing any of that in either place will break at runtime (we hit exactly
+this bug with `@vercel/otel` on the Edge runtime — see `ARCHITECTURE.md`
+§4). The one safe exception is `@yourorg/otel/src/trace-context` — a
+separate subpath with zero Node dependencies, built specifically so the
+browser has something it *can* safely import.
 
 **Q: What happens if someone bookmarks `/flight/payment` and opens it directly, skipping steps 1-6?**
 A: `middleware.ts` notices there's no `journey_id` cookie, generates a
@@ -421,10 +550,11 @@ fallback one, and flags it via an `x-journey-fallback` header so the page
 logs a warning instead of silently pretending it's a normal flow. See
 `ARCHITECTURE.md` for the full fallback design.
 
-**Q: Do these three IDs ever get confused with each other in the logs?**
-A: No — each has its own field name (`trace_id`, `correlation_id`,
+**Q: Do these IDs ever get confused with each other in the logs?**
+A: No — each has its own field name (`trace_id`, `external_correlation_id`,
 `journey_id`), and `createLogger()` stamps whichever ones are active onto
-every log line automatically. You'll often see all three on one line.
+every log line automatically. On the payment step you'll see all three on
+one line at once.
 
 ---
 
@@ -433,20 +563,35 @@ every log line automatically. You'll often see all three on one line.
 The best way to really understand this is to run it and watch the IDs
 appear:
 
-1. **See `trace_id` alone:**
+1. **See `trace_id` alone (server-generated):**
    ```bash
    curl -i http://localhost:3000/api/orders
    ```
    Note the `x-trace-id`. Run it again — it's different.
 
-2. **See `correlation_id` + `trace_id` together:**
+2. **See a hand-crafted `traceparent` become the actual `trace_id`:**
    ```bash
-   curl -i http://localhost:3000/api/orders -H "x-correlation-id: my-test-123"
+   curl -i http://localhost:3000/api/orders \
+     -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
    ```
-   Your `x-correlation-id` comes back unchanged; `x-trace-id` is still new
-   every time.
+   `x-trace-id` in the response comes back **exactly** as
+   `4bf92f3577b34da6a3ce929d0e0e4736` — the value you made up is now the
+   real trace_id. Search it in Jaeger; you'll find a full trace.
 
-3. **See `journey_id` survive multiple requests:**
+3. **See `external_correlation_id` appear only during the payment step:**
+   ```bash
+   rm -f /tmp/fc.txt
+   curl -s -c /tmp/fc.txt http://localhost:3000/flight/search -o /dev/null
+   for step in results seats passengers extras review payment; do
+     curl -s -b /tmp/fc.txt -c /tmp/fc.txt http://localhost:3000/flight/$step -o /tmp/$step.html
+   done
+   grep -o 'externalCorrelationId[^<]*<code>[^<]*' /tmp/payment.html
+   ```
+   You'll see it on `payment` — but if you `grep` the same pattern against
+   `/tmp/seats.html` or any other step, nothing shows up, because
+   `runWithExternalCorrelationId()` only wraps that one call.
+
+4. **See `journey_id` survive multiple requests:**
    ```bash
    curl -c /tmp/cookies.txt http://localhost:3000/flight/search -o /dev/null -s
    curl -b /tmp/cookies.txt http://localhost:3000/flight/results -o /tmp/r.html -s
@@ -455,5 +600,5 @@ appear:
    Compare the `journeyId` shown against the one from the first request —
    same value, even though it was a completely separate `curl` call.
 
-4. **Search Jaeger by `journey_id` and watch 8 traces come back at once** —
+5. **Search Jaeger by `journey_id` and watch 8 traces come back at once** —
    full walkthrough in `SSR_CSR_TRACING_DEMO.md` §7.

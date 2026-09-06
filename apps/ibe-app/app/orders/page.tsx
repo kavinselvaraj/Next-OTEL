@@ -5,14 +5,13 @@ import { fetchOrders } from "../lib/redux/ordersSlice";
 
 // CSR path demo: Redux dispatch -> client service -> api route -> server
 // service -> sdk. Open devtools network tab and watch the request to
-// /api/orders carry an `x-correlation-id` header generated in
-// orders-client-service.ts, and the response echo it back alongside
-// `x-trace-id` (the real OTEL trace, which only starts at the API route).
+// /api/orders carry a `traceparent` header generated in
+// orders-client-service.ts - @vercel/otel extracts it on arrival, so the
+// `x-trace-id` the response echoes back is the EXACT trace-id the browser
+// generated, not a new one created server-side.
 export default function OrdersPage() {
   const dispatch = useAppDispatch();
-  const { orders, status, error, correlationId, traceId } = useAppSelector(
-    (state) => state.orders
-  );
+  const { orders, status, error, traceId } = useAppSelector((state) => state.orders);
 
   return (
     <div style={{ padding: "20px", fontFamily: "sans-serif" }}>
@@ -29,8 +28,6 @@ export default function OrdersPage() {
       {status === "succeeded" && (
         <div style={{ marginTop: "16px" }}>
           <p>
-            correlationId: <code>{correlationId}</code>
-            <br />
             traceId: <code>{traceId ?? "n/a"}</code>
           </p>
           <ul>
@@ -47,8 +44,6 @@ export default function OrdersPage() {
         <div style={{ marginTop: "16px", color: "red" }}>
           <p>Request failed: {error}</p>
           <p>
-            correlationId: <code>{correlationId ?? "n/a"}</code>
-            <br />
             traceId: <code>{traceId ?? "n/a"}</code>
           </p>
         </div>

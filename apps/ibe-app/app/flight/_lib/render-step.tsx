@@ -51,6 +51,12 @@ export async function renderFlightStep({
               <span style={{ color: "#b45309" }}>⚠ fallback journey_id (no cookie found)</span>
             </>
           )}
+          {result.externalCorrelationId && (
+            <>
+              <br />
+              externalCorrelationId (sent to PSS/POP): <code>{result.externalCorrelationId}</code>
+            </>
+          )}
         </p>
 
         <pre style={{ background: "#f0f0f0", padding: "10px", overflowX: "auto" }}>

@@ -1,5 +1,5 @@
 import { trace, SpanStatusCode } from "@opentelemetry/api";
-import { getCorrelationId } from "./correlation";
+import { getExternalCorrelationId } from "./external-correlation";
 import { getJourneyId } from "./journey";
 
 export type LogLevel = "DEBUG" | "INFO" | "WARN" | "ERROR";
@@ -35,7 +35,7 @@ export function createLogger(name: string) {
       const timestamp = new Date().toISOString();
       const color = colorMap[level];
       const traceContext = getTraceContext();
-      const correlationId = getCorrelationId();
+      const externalCorrelationId = getExternalCorrelationId();
       const journeyId = getJourneyId();
 
       // JSON object for structured logging
@@ -45,7 +45,7 @@ export function createLogger(name: string) {
         logger: name,
         message,
         ...(journeyId && { journey_id: journeyId }),
-        ...(correlationId && { correlation_id: correlationId }),
+        ...(externalCorrelationId && { external_correlation_id: externalCorrelationId }),
         ...(traceContext && { trace_id: traceContext.traceId, span_id: traceContext.spanId }),
         ...(attributes && attributes),
       };
@@ -58,7 +58,7 @@ export function createLogger(name: string) {
         const prefix = `${color}[${level}]${resetColor}`;
         const idSuffix = [
           journeyId ? `journey=${journeyId}` : undefined,
-          correlationId ? `correlation=${correlationId}` : undefined,
+          externalCorrelationId ? `external=${externalCorrelationId}` : undefined,
           traceContext ? `trace=${traceContext.traceId}` : undefined,
         ]
           .filter(Boolean)
@@ -78,7 +78,7 @@ export function createLogger(name: string) {
             "log.message": message,
             "log.level": level,
             "log.logger": name,
-            ...(correlationId && { "log.correlation_id": correlationId }),
+            ...(externalCorrelationId && { "log.external_correlation_id": externalCorrelationId }),
             ...(attributes && flattenAttributes(attributes)),
           });
 

@@ -1,25 +1,26 @@
 import { headers } from "next/headers";
 import { createLogger } from "@yourorg/otel";
+import { generateTraceparent } from "@yourorg/otel/src/trace-context";
 
 const logger = createLogger("pages/orders-ssr");
 
 // SSR path demo: page (server component) -> /api/orders -> server service
 // -> sdk -> backend. Unlike the CSR page, there's no client service - the
-// page itself generates the correlation ID and calls the same API route
-// directly during render, over a real HTTP request (Server Components
-// don't get an implicit base URL for self-fetches, hence reading `host`
-// from headers()).
+// page itself generates a `traceparent` header and calls the same API
+// route directly during render, over a real HTTP request (Server
+// Components don't get an implicit base URL for self-fetches, hence
+// reading `host` from headers()).
 export default async function OrdersSSRPage() {
   const host = headers().get("host");
   const protocol = process.env.NODE_ENV === "production" ? "https" : "http";
   const baseUrl = `${protocol}://${host}`;
 
-  const correlationId = crypto.randomUUID();
+  const traceparent = generateTraceparent();
 
-  logger.info("Rendering orders-ssr page", { correlationId });
+  logger.info("Rendering orders-ssr page");
 
   const res = await fetch(`${baseUrl}/api/orders`, {
-    headers: { "x-correlation-id": correlationId },
+    headers: { traceparent },
     cache: "no-store",
   });
   const data = await res.json();
@@ -33,8 +34,6 @@ export default async function OrdersSSRPage() {
       </p>
 
       <p>
-        correlationId: <code>{data.correlationId}</code>
-        <br />
         traceId: <code>{data.traceId ?? "n/a"}</code>
       </p>
 

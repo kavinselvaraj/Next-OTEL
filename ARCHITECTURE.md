@@ -11,11 +11,19 @@ is the "why it's shaped this way" companion to both.
 
 ## 1. System Overview
 
+> **Revision note:** this section originally described a custom
+> `x-correlation-id` header for the browser→server boundary. That's been
+> superseded by **client-generated `traceparent`** (§1a below) — the
+> custom correlation mechanism (`packages/otel/src/external-correlation.ts`)
+> still exists, but is now scoped specifically to calls that leave our own
+> systems entirely (external vendors like a PSS/POP integration). See
+> Decision 1 (superseded) and Decision 8 in §5.
+
 ```mermaid
 flowchart TB
     subgraph Browser["🌐 Browser"]
         Redux["Redux Store\n(ordersSlice, thunk)"]
-        ClientService["Client Service\n(orders-client-service.ts)\nNO @yourorg/otel import"]
+        ClientService["Client Service\n(orders-client-service.ts)\nimports ONLY trace-context.ts\n(no async_hooks)"]
         Redux --> ClientService
     end
 
@@ -26,27 +34,32 @@ flowchart TB
     end
 
     subgraph SDK["packages/sdk"]
-        CallBackend["callBackend()\nglobal fetch"]
+        CallBackend["callBackend()\nglobal fetch\n(our own backend, e.g. Java)"]
+        CallExternal["callExternalSystem()\n(PSS/POP - vendor, no OTEL assumed)"]
     end
 
     subgraph OtelPkg["packages/otel"]
         Logger["createLogger()"]
-        Correlation["correlation.ts\n(AsyncLocalStorage)"]
+        TraceCtx["trace-context.ts\n(generateTraceparent - browser-safe)"]
+        ExtCorrelation["external-correlation.ts\n(AsyncLocalStorage, PSS/POP only)"]
         Register["register()\n@vercel/otel"]
     end
 
-    Backend[("Real Backend")]
+    OwnBackend[("Our Backend\n(e.g. Java, OTEL-aware)")]
+    ExternalVendor[("External PSS/POP\n(NOT OTEL-aware)")]
     Collector["OTEL Collector"]
     Jaeger[("Jaeger")]
 
-    ClientService -- "fetch + x-correlation-id" --> ApiRoute
-    SSRPage -- "fetch + x-correlation-id" --> ApiRoute
+    ClientService -. "generates via" .-> TraceCtx
+    ClientService -- "fetch + traceparent header" --> ApiRoute
+    SSRPage -- "fetch + traceparent header" --> ApiRoute
     ApiRoute -- "in-process call" --> ServerService
     ServerService -- "in-process call" --> CallBackend
-    CallBackend -- "auto-instrumented fetch" --> Backend
+    ServerService -- "in-process call\n(wrapped in runWithExternalCorrelationId)" --> CallExternal
+    CallBackend -- "auto-instrumented fetch\n(traceparent propagates automatically)" --> OwnBackend
+    CallExternal -- "fetch + x-external-correlation-id\n(NOT trace-aware)" --> ExternalVendor
 
-    ApiRoute -.-> Correlation
-    CallBackend -.-> Correlation
+    CallExternal -.-> ExtCorrelation
     ApiRoute -.-> Logger
     ServerService -.-> Logger
     CallBackend -.-> Logger
@@ -56,17 +69,78 @@ flowchart TB
     Collector -- "batched export" --> Jaeger
 ```
 
-**Two identifiers travel through every request, for different reasons:**
+**Three identifiers travel through requests, for three different reasons:**
 
 | ID | Created by | Exists for | Carried via |
 |---|---|---|---|
-| `trace_id` | OTEL, automatically, the moment a span opens | Server-side spans: API route → server service → sdk → backend | OTEL's own context propagation (`AsyncLocalStorage` inside `@opentelemetry/api`) |
-| `correlation_id` | Our own code, at the true origin of the request | Everything, including the parts OTEL can't see (the browser) | A plain `x-correlation-id` HTTP header, read via our own `AsyncLocalStorage` (`packages/otel/src/correlation.ts`) |
+| `trace_id` | Client-generated `traceparent` (browser/SSR) or OTEL itself if none was sent | The whole controlled chain: browser → API route → server service → sdk → **our own backend** | The W3C `traceparent` HTTP header — a real OTEL trace, not a custom field |
+| `external_correlation_id` | Our own code, immediately before calling an **external, uncontrolled** system | Only that one outbound call to a vendor system that may not run OTEL at all | A plain `x-external-correlation-id` header, our own `AsyncLocalStorage` (`packages/otel/src/external-correlation.ts`) |
+| `journey_id` | `middleware.ts`, once, at a flow's entry point | An entire multi-page flow spanning many separate traces (§4) | A cookie |
 
-The `trace_id` only exists once a request reaches an instrumented server
-span — it **cannot** originate in the browser here, because there's no OTEL
-SDK loaded client-side (see §4, Decision 2). The `correlation_id` exists
-specifically to cover that gap.
+The key shift from the original design: `trace_id` is no longer purely
+server-generated. A hand-formatted `traceparent` header, sent from the
+browser or an SSR page with **no browser OTEL SDK involved**, becomes the
+literal `trace_id` Jaeger records — verified directly against this repo
+(§1a). `external_correlation_id` exists for exactly the one case
+`traceparent` can't help with: a vendor system we don't control and can't
+assume will honor W3C trace context at all.
+
+---
+
+## 1a. Why `traceparent` Instead of a Custom Header
+
+### The mechanism
+
+W3C Trace Context extraction doesn't require the sender to be a "real"
+participating tracer — it just reads a correctly-formatted header and
+treats it as a remote parent. This means the browser can hand-format a
+spec-compliant value using nothing but `crypto.randomUUID()` (no OTEL
+library needed client-side), and `@vercel/otel`'s existing Node HTTP
+auto-instrumentation extracts it **automatically, with zero code change on
+the server**.
+
+```
+traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01
+             │  └────────trace-id (32 hex)────────┘ └parent-id(16)┘ └flags┘
+          version
+```
+
+### Verified, not assumed
+
+Before wiring this into any UI code, this was tested directly against the
+running app:
+
+```bash
+curl -s -D - http://localhost:3000/api/orders \
+  -H "traceparent: 00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+# x-trace-id: 4bf92f3577b34da6a3ce929d0e0e4736   ← EXACTLY the hand-crafted trace-id
+```
+
+Querying Jaeger for that exact trace-id returned a **fully populated
+trace** — 5 spans, including the SDK's outbound fetch to the backend — all
+under the hand-crafted ID. No real OTEL SDK ever ran client-side to
+produce it.
+
+### What this replaces
+
+| | Before (`correlation_id`) | Now (`traceparent`) |
+|---|---|---|
+| Header | Custom `x-correlation-id` | W3C standard `traceparent` |
+| What Jaeger does with it | Nothing — a plain string we searched manually | **Becomes the actual `trace_id`** |
+| Crosses into our own Java backend | Only with custom code on both sides | **Automatically** — any OTEL-instrumented service extracts it by default |
+| One Jaeger view of Next.js + Java together | No — two systems, manually cross-referenced | **Yes** — one continuous trace |
+
+### The browser-safety mechanism
+
+`generateTraceparent()` lives in `packages/otel/src/trace-context.ts` —
+deliberately dependency-free (just `crypto.randomUUID()`), and imported by
+browser code via its **direct subpath** (`@yourorg/otel/src/trace-context`),
+never through the package's main entry. The main entry (`index.ts`)
+eagerly imports `@vercel/otel`, which is Node-only — importing anything
+from it in a browser bundle risks the same class of failure as the
+Edge-runtime bug in §4. Confirmed after the change: the `/orders` CSR
+page's bundle size barely moved (1.09 kB → 1.1 kB), meaning the Node-only
+code stayed out of the browser bundle.
 
 ---
 
@@ -83,25 +157,25 @@ sequenceDiagram
     participant OTEL as Collector → Jaeger
 
     U->>SSR: GET /orders-ssr
-    SSR->>SSR: correlationId = crypto.randomUUID()
+    SSR->>SSR: traceparent = generateTraceparent()
     Note over SSR,API: Real HTTP call - Server Components<br/>have no implicit self-fetch context
-    SSR->>API: GET /api/orders<br/>(x-correlation-id header)
+    SSR->>API: GET /api/orders<br/>(traceparent header)
 
-    Note over API: runWithCorrelationId(id, async () => { ... })
+    Note over API: @vercel/otel extracts traceparent<br/>BEFORE the handler runs - trace_id is<br/>now the value SSR generated
     API->>SVC: getOrders()
     Note over API,SDK: Plain in-process function calls -<br/>OTEL span propagates automatically<br/>via AsyncLocalStorage, no extra code
     SVC->>SDK: callBackend({ path })
-    SDK->>BE: fetch (auto-traced HTTP client span)
+    SDK->>BE: fetch (auto-traced, traceparent<br/>propagates onward automatically)
     BE-->>SDK: 200 + JSON
     SDK-->>SVC: data
     SVC-->>API: orders
 
-    API-->>SSR: 200 { orders, correlationId, traceId }<br/>+ x-correlation-id, x-trace-id headers
-    SSR-->>U: Rendered HTML (orders + both IDs visible)
+    API-->>SSR: 200 { orders, traceId }<br/>+ x-trace-id header
+    SSR-->>U: Rendered HTML (traceId visible)
 
     par Every hop, in parallel with the response
-        API-)OTEL: span events + logs (trace_id + correlation_id)
-        SVC-)OTEL: log lines (same trace_id + correlation_id)
+        API-)OTEL: span events + logs (trace_id)
+        SVC-)OTEL: log lines (same trace_id)
         SDK-)OTEL: auto-traced fetch span + log lines
     end
 ```
@@ -133,25 +207,25 @@ sequenceDiagram
     Page->>Thunk: dispatch(fetchOrders())
     Note over Page,Thunk: dispatch() is synchronous -<br/>the async work is inside the thunk
     Thunk->>CS: fetchOrdersFromClient()
-    CS->>CS: correlationId = crypto.randomUUID()
+    CS->>CS: traceparent = generateTraceparent()<br/>(imports @yourorg/otel/src/trace-context ONLY)
 
-    Note over CS,API: This is where the OTEL trace actually<br/>begins - nothing upstream of here is traced
-    CS->>API: GET /api/orders<br/>(x-correlation-id header)
+    Note over CS,API: This is where the OTEL trace actually<br/>begins - but the trace_id itself was<br/>chosen by the browser, not the server
+    CS->>API: GET /api/orders<br/>(traceparent header)
 
-    Note over API: runWithCorrelationId(id, ...) - new trace starts here
+    Note over API: @vercel/otel extracts traceparent<br/>automatically - trace_id = the browser's value
     API->>SVC: getOrders()
     SVC->>SDK: callBackend({ path })
-    SDK->>BE: fetch (auto-traced)
+    SDK->>BE: fetch (auto-traced, traceparent<br/>propagates onward automatically)
     BE-->>SDK: 200 + JSON
     SDK-->>SVC: data
     SVC-->>API: orders
 
-    API-->>CS: 200 { orders, correlationId, traceId }<br/>+ x-correlation-id, x-trace-id headers
+    API-->>CS: 200 { orders, traceId }<br/>+ x-trace-id header (== the browser's trace-id)
     CS-->>Thunk: result
-    Thunk->>Thunk: fulfilled → state.orders, correlationId, traceId
-    Thunk-->>Page: re-render with data + both IDs
+    Thunk->>Thunk: fulfilled → state.orders, traceId
+    Thunk-->>Page: re-render with data + traceId
 
-    API-)OTEL: span events + logs (trace_id + correlation_id)
+    API-)OTEL: span events + logs (trace_id)
 ```
 
 ### Failure path (why `rejectWithValue` matters)
@@ -164,12 +238,12 @@ sequenceDiagram
     participant State as Redux State
 
     CS->>API: GET /api/orders
-    API-->>CS: 502 { success:false, error, correlationId, traceId }
+    API-->>CS: 502 { success:false, error, traceId }
     Note over CS: Does NOT throw - always resolves<br/>with the parsed body
     CS-->>Thunk: result (success: false)
     Thunk->>Thunk: rejectWithValue(result)
-    Note over Thunk,State: If this threw a bare Error instead,<br/>correlationId/traceId would be lost
-    Thunk-->>State: rejected, payload = { error, correlationId, traceId }
+    Note over Thunk,State: If this threw a bare Error instead,<br/>traceId would be lost
+    Thunk-->>State: rejected, payload = { error, traceId }
     Note over State: UI can show "Failed - ref: traceId"<br/>instead of just "Something went wrong"
 ```
 
@@ -264,11 +338,11 @@ fix is the `process.env.NEXT_RUNTIME === "nodejs"` guard now in both apps'
 
 ### Span attribute, not log field
 
-`correlation_id` is attached to spans as a **log-event field**
-(`span.addEvent(..., { "log.correlation_id": id })`). That's fine when you
-already have the trace open. But Jaeger's tag search matches **span tags**,
-not nested log-event fields — so `journey_id` is set via
-`span.setAttribute()` instead. That single difference is what makes
+`external_correlation_id` (§4a below) is attached to spans as a **log-event
+field** (`span.addEvent(..., { "log.external_correlation_id": id })`).
+That's fine when you already have the trace open. But Jaeger's tag search
+matches **span tags**, not nested log-event fields — so `journey_id` is set
+via `span.setAttribute()` instead. That single difference is what makes
 `tags={"journey_id":"<id>"}` return all 8 traces rather than nothing.
 
 Each page also tags `journey_step`, and the terminal page tags
@@ -278,27 +352,100 @@ makes drop-off analysis queryable: count distinct `journey_id`s with
 
 ---
 
+## 4a. The External System Boundary (PSS/POP)
+
+Everything above — `traceparent`, `journey_id` — assumes both ends of a
+call run OTEL and cooperate with trace context. That assumption breaks the
+moment a request leaves to a **vendor system we don't control**: an airline
+PSS (Passenger Service System), a POP integration, a payment gateway. These
+almost certainly don't run OTEL, and won't extract or forward a
+`traceparent` header the way our own services do.
+
+```mermaid
+sequenceDiagram
+    participant SVC as Server Service<br/>(flight-journey-service.ts)
+    participant SDK as SDK<br/>callExternalSystem()
+    participant PSS as External PSS/POP<br/>(NOT OTEL-aware)
+    participant J as Jaeger
+
+    Note over SVC: Payment step only
+    SVC->>SVC: externalCorrelationId = crypto.randomUUID()
+    SVC->>SVC: runWithExternalCorrelationId(id, async () => { ... })
+    SVC->>SDK: callExternalSystem({ path })
+    SDK->>PSS: fetch + x-external-correlation-id header
+    Note over PSS: PSS may ignore this header entirely -<br/>no assumption it does anything with it
+    PSS-->>SDK: response
+    SDK-)J: log: "External system call succeeded"<br/>(external_correlation_id, trace_id, journey_id)
+    SDK-->>SVC: data
+```
+
+### Why this can't just be `traceparent` too
+
+If PSS doesn't read `traceparent`, sending it accomplishes nothing on their
+end — no harm, but no benefit either. What actually matters is that **our
+own** request/response logs durably record "we sent PSS this exact ID, on
+this exact call, at this exact time" — regardless of what PSS does with it.
+That's a plain custom header doing a plain job: a breadcrumb on our side,
+not a distributed-tracing mechanism.
+
+### Why it's a separate module from `journey_id`
+
+Both `external-correlation.ts` and `journey.ts` use the same
+`AsyncLocalStorage` pattern, but their scopes don't overlap:
+`external_correlation_id` is scoped to **one outbound call** (regenerated
+each time, like the old `correlation_id` was); `journey_id` is scoped to
+**the whole multi-page flow** (generated once, reused for hours). Keeping
+them as separate modules keeps that distinction obvious in the code, not
+just in a comment.
+
+### Where this lives in the demo
+
+`packages/sdk/src/index.ts` exports two functions with different
+contracts:
+- `callBackend()` — our own backend (Java, in a real deployment). No
+  correlation code at all — `traceparent` propagation is automatic.
+- `callExternalSystem()` — the PSS/POP stand-in. Explicitly reads
+  `getExternalCorrelationId()` and sends it as `x-external-correlation-id`.
+
+`flight-journey-service.ts`'s payment step is the one place both are called
+side by side, so the difference is visible directly in the code and in
+Jaeger (two separate outbound fetch spans, one with the header, one
+without).
+
+---
+
 ## 5. Decisions Behind This Shape
 
-Seven decisions define why the architecture looks like this rather than the
+Eight decisions define why the architecture looks like this rather than the
 more obvious alternatives. Each was made explicitly, not by default.
 
-### Decision 1 — Correlation ID vs. full browser tracing (chosen: correlation ID)
+### Decision 1 — Correlation ID vs. full browser tracing (SUPERSEDED — see below)
 
-**Rejected alternative:** load `@opentelemetry/sdk-trace-web` +
+**Original rejected alternative:** load `@opentelemetry/sdk-trace-web` +
 fetch instrumentation in the browser, so the trace genuinely starts at the
 Redux dispatch.
 
-**Why not:** it costs client bundle size on every page, needs CORS
-configuration on the collector (browser calls are cross-origin, unlike
+**Original reasoning:** that costs client bundle size on every page, needs
+CORS configuration on the collector (browser calls are cross-origin, unlike
 server→collector which is same docker network), and requires exposing the
 collector endpoint publicly instead of keeping it on `localhost`/internal
-network only.
+network only. **What we did at the time:** a plain `crypto.randomUUID()` in
+the client service, forwarded as `x-correlation-id`.
 
-**What we did instead:** a plain `crypto.randomUUID()` in the client
-service, forwarded as `x-correlation-id`. The "real" OTEL trace still starts
-at the API route, but the correlation ID lets a user-reported error be tied
-back to its origin regardless.
+**Why this decision was revisited:** the original framing missed a middle
+option — you don't need a full browser tracer SDK to get a *real* trace_id
+from the browser. W3C Trace Context extraction doesn't require the sender
+to be a genuine OTEL participant; a hand-formatted `traceparent` header
+works too, and `@vercel/otel`'s existing server-side auto-instrumentation
+already extracts it with zero code change (verified in §1a). This keeps
+every original concern addressed — no browser bundle cost, no CORS/collector
+exposure — while upgrading the outcome from "a custom field we search
+manually" to "the actual trace_id, native to Jaeger, continuing
+automatically into our own Java backend too."
+
+**Current state:** `x-correlation-id` no longer exists for this boundary.
+The client sends `traceparent` instead (§1a). The `correlation.ts` module
+was renamed to `external-correlation.ts` and rescoped — see Decision 8.
 
 ### Decision 2 — Auto instrumentation vs. manual spans in the SDK (chosen: auto)
 
@@ -367,16 +514,38 @@ scenario; worth revisiting if that changes.
 
 ### Decision 7 — `journey_id` as a span attribute, not a log field
 
-`correlation_id` is attached to spans via `span.addEvent(..., { "log.correlation_id": id })`
-— sufficient once you already have one trace open, since you're reading
-event details inside it. `journey_id` needs something stronger: the entire
-point is finding traces you *don't* already have open, across 8 separate
-ones. Jaeger's tag search matches span-level tags, not fields buried
-inside log events — so `journey_id` is set via `span.setAttribute()`
-instead. Verified directly: querying Jaeger's API with
-`tags={"journey_id":"<id>"}` returned all 8 traces only after switching to
-`setAttribute`; the event-only approach would have returned nothing outside
-a specific trace already known.
+`external_correlation_id` is attached to spans via
+`span.addEvent(..., { "log.external_correlation_id": id })` — sufficient
+once you already have one trace open, since you're reading event details
+inside it. `journey_id` needs something stronger: the entire point is
+finding traces you *don't* already have open, across 8 separate ones.
+Jaeger's tag search matches span-level tags, not fields buried inside log
+events — so `journey_id` is set via `span.setAttribute()` instead. Verified
+directly: querying Jaeger's API with `tags={"journey_id":"<id>"}` returned
+all 8 traces only after switching to `setAttribute`; the event-only
+approach would have returned nothing outside a specific trace already
+known.
+
+### Decision 8 — Keep a custom correlation ID, but only for uncontrolled external systems
+
+**Why not delete `correlation_id` entirely once `traceparent` was
+adopted:** because `traceparent` only earns its value when *both* ends
+extract and honor it. A vendor PSS/POP integration almost certainly
+doesn't run OTEL — sending it `traceparent` is harmless but produces no
+benefit, since nothing on their end will act on it or continue the trace.
+
+**What we did instead:** kept the exact same mechanism (`AsyncLocalStorage`,
+generated fresh per call, forwarded as a header) but renamed and rescoped
+it — `correlation.ts` → `external-correlation.ts`,
+`runWithCorrelationId`/`getCorrelationId` →
+`runWithExternalCorrelationId`/`getExternalCorrelationId`, header
+`x-correlation-id` → `x-external-correlation-id`. It's now used in exactly
+one place: `callExternalSystem()` in `packages/sdk`, called from the
+flight flow's payment step (§4a) to simulate a PSS/POP call. The rename
+matters as much as the code — `correlation_id` meaning "browser→our
+server" and then silently meaning "our server→external vendor" without a
+name change would have been confusing to anyone reading logs from both
+eras of this codebase.
 
 ---
 
@@ -424,6 +593,18 @@ decisions were made:
    `register()` on Edge as well as Node, where `@vercel/otel` isn't safe to
    load — fixed with the `NEXT_RUNTIME === "nodejs"` guard.
 
+8. **Revisited Decision 1 once a polyglot backend entered the picture** —
+   once a separate Java backend needed its own OTEL rollout, the original
+   `x-correlation-id` design stopped being the best answer for the
+   browser→server boundary: a real distributed trace spanning Next.js *and*
+   Java, via standard `traceparent` propagation, was achievable without a
+   browser tracer SDK after all (§1a). Verified the core assumption with a
+   hand-crafted `traceparent` header before writing any UI code. This also
+   surfaced a real, separate problem `traceparent` *doesn't* solve: calls to
+   external vendor systems (PSS/POP) that don't run OTEL at all — which is
+   what the renamed `external-correlation.ts` and `callExternalSystem()`
+   (§4a) exist for.
+
 ---
 
 ## 7. Implementing This in a Real Project
@@ -434,7 +615,7 @@ not just this demo repo.
 ### Rename the shared packages
 `@yourorg/otel` and `@yourorg/sdk` are placeholder scopes. Rename them to
 your actual npm/org scope before this leaves demo status — the pattern
-(shared `createLogger`, `getTraceContext`, `runWithCorrelationId`,
+(shared `createLogger`, `getTraceContext`, `generateTraceparent`,
 `callBackend`) stays identical either way.
 
 ### Point at your real backend
@@ -448,33 +629,70 @@ Jaeger with whatever your organization actually uses (Datadog, Honeycomb,
 CloudWatch via the AWS OTEL exporter, etc.) — apps and `.env.local` are
 unaffected by this change.
 
-### Reuse the four exports everywhere, not just `/api/orders`
-Every new API route in a real project should follow the same shape:
+### Reuse the pattern everywhere, not just `/api/orders`
+Every new API route in a real project should follow the same shape — and
+notice it's now *simpler* than the old correlation-id version, since
+`@vercel/otel` already extracted `traceparent` before your handler runs:
 ```typescript
-const correlationId = request.headers.get("x-correlation-id") ?? crypto.randomUUID();
-return runWithCorrelationId(correlationId, async () => {
-  // ... logger.info/error, getTraceContext()?.traceId, response headers
+export async function GET(request: NextRequest) {
+  const traceId = getTraceContext()?.traceId; // already the caller's trace-id, if they sent traceparent
+  // ... logger.info/error, response headers
+}
+```
+If any hop in this route calls an **external, uncontrolled** system, wrap
+just that call:
+```typescript
+const externalCorrelationId = crypto.randomUUID();
+await runWithExternalCorrelationId(externalCorrelationId, async () => {
+  await callExternalSystem({ path });
 });
 ```
-This is boilerplate worth extracting into a small wrapper/middleware once
-there are more than two or three routes doing it identically — the demo
-keeps it inline per-route for clarity, but a real project shouldn't repeat
-it by hand everywhere.
 
 ### Keep the browser/server boundary strict
-Never import `@yourorg/otel` (or anything using `async_hooks`) from a file
-that runs in the browser — `orders-client-service.ts` is the template for
-that boundary. If a future client service needs logging, use a lightweight
-browser-safe logger, not `createLogger`.
+Never import `@yourorg/otel`'s main entry (or anything using `async_hooks`)
+from a file that runs in the browser — `orders-client-service.ts` is the
+template for that boundary. The one thing that IS safe to import from the
+browser is `@yourorg/otel/src/trace-context` (the `generateTraceparent()`
+subpath), specifically because it has zero Node dependencies. If a future
+client service needs logging, use a lightweight browser-safe logger, not
+`createLogger`.
 
 ### Decide the SSR self-fetch question per project
 Decision 3 above notes a real tradeoff: SSR self-fetching its own API route
 costs a network round-trip. For a latency-sensitive page, consider having
 SSR call the server service directly (in-process, no HTTP hop) and reserve
 the API route purely for CSR. If you do this, the SSR page needs to
-generate/set the correlation ID itself and call
-`runWithCorrelationId()` directly, since there's no API route to do it for
-you in that path.
+generate its own `traceparent` (via `generateTraceparent()`) and pass it
+along however the direct call needs it, since there's no API route
+extracting it for you in that path.
+
+### Instrumenting the Java backend (or any other polyglot service)
+This is what actually makes `traceparent` worth adopting — see §1a and
+Decision 1. The natural counterpart to `@vercel/otel`'s auto-instrumentation
+is the **OpenTelemetry Java Agent**:
+```bash
+java -javaagent:opentelemetry-javaagent.jar \
+  -Dotel.service.name=java-backend \
+  -Dotel.exporter.otlp.endpoint=http://<collector-host>:4317 \
+  -jar your-app.jar
+```
+Zero custom Java code required — the agent auto-instruments common
+frameworks (Spring, servlets, JDBC) and, critically, **auto-extracts
+incoming `traceparent` headers by default**, continuing the exact trace
+`callBackend()`'s outbound fetch carries. Point it at the same OTEL
+Collector this repo already runs (§5 Decision 5) — a Java service is just
+another OTLP producer, no collector architecture change needed. Do this
+alongside the resource-attributes item below: consistent `service.name`/
+`deployment.environment` conventions matter more, not less, once multiple
+languages feed one Jaeger instance.
+
+### The external-system boundary is a checklist item on its own
+Before assuming any given integration can use `traceparent`, confirm the
+far side actually runs OTEL. If it's a vendor system you don't control
+(payment gateway, PSS/GDS, any third-party API) — use the
+`callExternalSystem()` pattern (§4a) instead: a plain custom header, purely
+for your own request/response logs, no assumption the vendor does anything
+with it.
 
 ### Add resource attributes before going to production
 Not yet in this repo: `service.version`, `deployment.environment`
@@ -520,11 +738,13 @@ apply regardless of the domain.
 |---|---|---|
 | `createLogger(name)` | `packages/otel/src/log-helper.ts` | Every layer: API route, server service, sdk |
 | `getTraceContext()` | `packages/otel/src/log-helper.ts` | API route (response headers), anywhere needing the trace ID |
-| `runWithCorrelationId(id, fn)` | `packages/otel/src/correlation.ts` | Wraps the API route handler body |
-| `getCorrelationId()` | `packages/otel/src/correlation.ts` | Read implicitly by `createLogger`, explicitly by `callBackend` |
+| `generateTraceparent()` | `packages/otel/src/trace-context.ts` (import via `/src/trace-context` subpath — browser-safe) | `orders-client-service.ts` (browser), `orders-ssr/page.tsx` |
+| `runWithExternalCorrelationId(id, fn)` | `packages/otel/src/external-correlation.ts` | Wraps only the call to an external system, e.g. in `flight-journey-service.ts`'s payment step |
+| `getExternalCorrelationId()` | `packages/otel/src/external-correlation.ts` | Read implicitly by `createLogger`, explicitly by `callExternalSystem()` |
 | `runWithJourneyId(id, fn)` | `packages/otel/src/journey.ts` | Wraps each flight-flow page's render |
 | `getJourneyId()` | `packages/otel/src/journey.ts` | Read implicitly by `createLogger` |
 | `tagJourneyStep(id, step)` / `tagJourneyStatus(id, status)` | `packages/otel/src/journey.ts` | Called once per page, in `flight-journey-service.ts` / `render-step.tsx` |
-| `callBackend(opts)` | `packages/sdk/src/index.ts` | Server service's only way to reach the backend |
+| `callBackend(opts)` | `packages/sdk/src/index.ts` | Server service → OUR OWN backend (e.g. Java) — traceparent propagates automatically, no correlation code |
+| `callExternalSystem(opts)` | `packages/sdk/src/index.ts` | Server service → an EXTERNAL vendor (PSS/POP) — explicit `x-external-correlation-id` header |
 | `journey_id` cookie logic | `apps/ibe-app/middleware.ts` | Runs before every `/flight/*` page (Edge runtime) |
-| OTEL Collector config | `otel-collector-config.yaml` | The one place to change when swapping trace backends |
+| OTEL Collector config | `otel-collector-config.yaml` | The one place to change when swapping trace backends, or adding a Java service as another OTLP producer |
